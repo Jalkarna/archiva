@@ -2,7 +2,20 @@
 
 Git-native decision memory for AI coding agents.
 
-Archiva records what was chosen, why it was chosen, what was rejected, and which AST anchor the decision belongs to. It gives MCP-capable coding agents a local memory layer that lives beside the code instead of in a chat transcript.
+Archiva records the reasoning behind meaningful code changes: what was chosen, why it was chosen, what alternatives were rejected, and which AST anchor the decision belongs to. The record lives in the repo beside the code, so the next agent, model, or developer can recover the context before editing.
+
+## Why
+
+Git remembers what changed. It does not remember why an implementation won over the alternatives.
+
+That missing reasoning is especially painful in agentic codebases:
+
+- a later agent sees code but not the constraints behind it
+- deliberate choices look accidental
+- rejected approaches get retried
+- ADRs drift away from the code they explain
+
+Archiva gives coding agents a small local memory layer. It stores decision records in `.decisions/`, indexes them by code anchor instead of fragile line numbers, and exposes the memory through a CLI and MCP tools.
 
 ## Install
 
@@ -10,69 +23,196 @@ Archiva records what was chosen, why it was chosen, what was rejected, and which
 npm install -g @jalkarna/archiva
 ```
 
-For local development:
+Verify the CLI:
 
 ```sh
-npm install
-npm run build
-node bin/archiva.js --help
+archiva --version
 ```
 
-## Commands
+Archiva requires Node.js 20 or newer.
+
+## Quick Start
+
+Initialize a repository:
 
 ```sh
 archiva init
-archiva status
-archiva why src/auth/session.ts 52
-archiva why src/auth/session.ts fn:processCheckout
-archiva history src/auth/session.ts fn:processCheckout
-archiva lint
-archiva hooks session-start
-ARCHIVA_FILE=src/auth/session.ts archiva hooks post-tool-use
-archiva mcp
 ```
 
-`archiva init` creates `.decisions/`, writes Claude hook/MCP settings, and appends Archiva instructions to `AGENTS.md`. Decision logs are intended to be tracked in git by default. Use `--gitignore-decisions` if the project explicitly wants local-only decisions.
-
-## Claude Code
+For Claude Code, also register the MCP server:
 
 ```sh
-archiva init
 claude mcp add -s local archiva -- archiva mcp
 ```
 
-Any MCP client can use the same stdio server command:
+After that, agents can call Archiva through MCP:
+
+- before editing, call `why`
+- after a meaningful implementation choice, call `write_decision`
+- when checking drift, call `ghost_check`
+
+## Usage
+
+### Initialize A Project
+
+```sh
+archiva init
+```
+
+Creates:
+
+- `.decisions/`
+- `.claude/settings.json` with Archiva hooks and MCP config
+- an `AGENTS.md` decision logging instruction block
+
+By default, decision files are intended to be committed with the code. If a project wants local-only decision logs, run:
+
+```sh
+archiva init --gitignore-decisions
+```
+
+### Check Decision Health
+
+```sh
+archiva status
+```
+
+Shows decision counts and drift/orphan health across the repo.
+
+### Ask Why Code Exists
+
+By line:
+
+```sh
+archiva why src/auth/session.ts 52
+```
+
+By anchor:
+
+```sh
+archiva why src/auth/session.ts fn:processCheckout
+```
+
+### View Decision History
+
+```sh
+archiva history src/auth/session.ts fn:processCheckout
+```
+
+Shows the supersession chain for an anchor.
+
+### Lint Decision State
+
+```sh
+archiva lint
+```
+
+Rules include:
+
+- stale decisions when code fingerprints change
+- orphan decisions when anchors disappear
+- complex undecided functions
+- stale decisions that were not superseded
+
+Safe orphan cleanup:
+
+```sh
+archiva lint --fix
+```
+
+### Run MCP Server
 
 ```sh
 archiva mcp
 ```
 
-## Decision Files
+This starts the stdio MCP server. Most users do not run it manually; MCP clients launch it from config.
 
-For a source file:
+### Run Hooks Manually
 
-```text
-src/auth/session.ts
+Session context injection:
+
+```sh
+archiva hooks session-start
 ```
 
-Archiva writes:
+Re-anchor a file after edits:
 
-```text
-.decisions/src/auth/session.ts.dlog
-.decisions/src/auth/session.ts.dmap
+```sh
+ARCHIVA_FILE=src/auth/session.ts archiva hooks post-tool-use
 ```
 
-The `.dlog` file is YAML and contains full decision records. The `.dmap` file is a compact line map used for low-token session context.
+or:
+
+```sh
+archiva hooks post-tool-use src/auth/session.ts
+```
+
+## MCP Configuration
+
+Use this config in MCP-capable tools that accept stdio servers:
+
+```json
+{
+  "mcpServers": {
+    "archiva": {
+      "command": "archiva",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+For tools that prefer a server object only:
+
+```json
+{
+  "command": "archiva",
+  "args": ["mcp"]
+}
+```
+
+For project-local Claude settings, `archiva init` writes:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "archiva hooks session-start"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "archiva hooks post-tool-use"
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "archiva": {
+      "command": "archiva",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
 ## MCP Tools
 
-Archiva exposes three stdio MCP tools:
+### `write_decision`
 
-- `write_decision`
-- `why`
-- `ghost_check`
-
-Example input for `write_decision`:
+Records a decision for a file and anchor.
 
 ```json
 {
@@ -86,17 +226,132 @@ Example input for `write_decision`:
       "approach": "SELECT FOR UPDATE",
       "reason": "deadlocks under concurrent carts touching the same SKU"
     }
-  ]
+  ],
+  "expires_if": "inventory service migrates to event sourcing",
+  "supersedes": "dec_001"
 }
 ```
+
+`supersedes` is optional. When present, it must reference an existing decision id returned by `why`.
+
+### `why`
+
+Reads decision memory before editing.
+
+```json
+{
+  "file": "src/auth/session.ts",
+  "anchor": "fn:processCheckout"
+}
+```
+
+If `anchor` is omitted, Archiva returns all decisions for the file.
+
+### `ghost_check`
+
+Checks a file for stale or orphaned decision state.
+
+```json
+{
+  "file": "src/auth/session.ts"
+}
+```
+
+## File Format
+
+For this source file:
+
+```text
+src/auth/session.ts
+```
+
+Archiva writes:
+
+```text
+.decisions/src/auth/session.ts.dlog
+.decisions/src/auth/session.ts.dmap
+```
+
+`.dlog` is the full YAML decision log. `.dmap` is a compact spatial map used for low-token context injection.
+
+Example `.dmap`:
+
+```text
+42-67:fn:processCheckout
+89-94:block:if_version_mismatch:STALE
+```
+
+## Agent Instructions
+
+Archiva works best when agents are explicitly told to use it:
+
+```md
+## Decision Logging (Archiva)
+
+Before modifying a file, read the decision map injected at session start or call the `why` MCP tool.
+
+After any non-trivial implementation choice, call `write_decision` with:
+- `file` and `anchor`
+- `chose`
+- `because`
+- `rejected`
+
+If changing code with an existing decision:
+- preserve the decision if the reasoning still holds
+- call `write_decision` with `supersedes` if the reasoning changed
+```
+
+`archiva init` adds a fuller version of this block to `AGENTS.md`.
 
 ## CI
 
 ```yaml
-- name: Check decision health
-  run: npx archiva lint
+name: Decision Health
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  archiva:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npx @jalkarna/archiva lint
+```
+
+## Development
+
+```sh
+npm install
+npm run check
+npm test
+npm run build
+node bin/archiva.js --help
 ```
 
 ## Current Scope
 
-The first implementation supports TypeScript and JavaScript anchors, YAML decision logs, compact maps, local re-anchoring, linting, Claude hooks, and stdio MCP tools. Python support and richer inline `@decision` comment management remain future hardening work.
+Archiva currently supports:
+
+- TypeScript and JavaScript anchor extraction
+- YAML `.dlog` files
+- compact `.dmap` files
+- local re-anchoring
+- linting
+- Claude Code hooks
+- stdio MCP tools
+
+Future hardening work:
+
+- Python anchors
+- richer inline `@decision` comment management
+- first-class setup docs for more IDEs and agent CLIs
+
+## License
+
+MIT
