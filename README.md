@@ -2,15 +2,15 @@
 
 Git-native decision memory for AI coding agents.
 
-Archiva gives coding agents a durable memory of engineering intent: what changed, why it changed, which alternatives were rejected, and where that decision belongs in the code.
+Every agent session starts cold. It doesn't know why that auth check is there, which approaches were tried and dropped, or that the team explicitly decided against the obvious solution two months ago. Archiva stores those decisions beside the code so agents can read them before touching anything.
 
-It runs as a CLI and MCP server, so tools like Claude Code, Codex, Cursor, Antigravity, and other MCP-capable agents can ask *why this code exists* before editing it, then write back the decision they just made.
+It runs as a CLI and MCP server. Tools like Claude Code, Codex, Cursor, and other MCP-capable agents can call `why` before editing a file and `write_decision` after making a meaningful choice.
 
-## Why Agents Need It
+## Why agents need it
 
-Git remembers what changed. It does not remember why.
+Git remembers what changed. It doesn't remember why.
 
-That missing reasoning is one of the easiest ways for AI coding agents to waste context and break working systems:
+That gap causes predictable problems:
 
 - the next session reopens the same problem from scratch
 - deliberate constraints look like accidental complexity
@@ -18,83 +18,64 @@ That missing reasoning is one of the easiest ways for AI coding agents to waste 
 - ADRs drift away from the code they describe
 - multi-agent work loses the thread between handoffs
 
-Archiva stores that reasoning in `.decisions/` beside the code, indexes it by source anchors, and exposes it through `archiva why`, `archiva history`, `archiva lint`, and MCP tools.
+Archiva stores reasoning in `.decisions/` beside the code, indexes it by source anchors, and exposes it through `archiva why`, `archiva history`, `archiva lint`, and MCP tools.
 
-## The Pitch
+## What it does
 
-Archiva is not another note-taking layer. It is repo-native memory built for agents.
+Decision records live in your repo, versioned with the code they describe, queryable by file and anchor. The design is intentionally repo-native: no daemon, no hosted service, no account.
 
-Measured today:
+Measured:
 
-- **Up to 94.4% smaller decision context** with compact `.dmap` startup maps versus full `.dlog` records.
-- **58.9% smaller session-start context** on the included fixture while keeping full decision detail available on demand.
-- **100% pass rate preserved** on a real Terminal-Bench smoke A/B where Claude Code used Archiva MCP, called `why`, wrote `dec_001`, and passed task validation.
+- **94.4% smaller decision context** with compact `.dmap` startup maps versus full `.dlog` records
+- **58.9% smaller session-start context** on the included fixture, with full decision detail still available on demand
+- **100% pass rate preserved** on a real Terminal-Bench smoke run where Claude Code used Archiva MCP, called `why`, wrote `dec_001`, and passed task validation
 
-Estimated for decision-heavy agent work:
+For decision-heavy agent work, the expected gains are fewer repeated-decision failures, lower token waste, and better patch consistency because agents can see rejected alternatives before reintroducing them. Those are targets for the next seeded SWE-bench/Terminal-Bench runs, not current leaderboard claims. The measured claim today is integration correctness and context reduction.
 
-- **Up to 10-20% fewer repeated-decision failures** when tasks involve prior design constraints, superseded approaches, or multi-session handoffs.
-- **Lower token waste** by loading compact decision maps first and fetching full rationale only for files or anchors the agent is about to touch.
-- **Better patch consistency** because agents can see rejected alternatives before reintroducing them.
+## Features
 
-Those accuracy estimates are targets for the next seeded SWE-bench/Terminal-Bench runs, not a leaderboard claim. The measured claim today is integration correctness plus context reduction.
+- Decision memory for agents: tools can ask why code exists before changing it
+- Rejected alternatives preserved: failed approaches stop getting rediscovered every session
+- Code-anchored rationale: decisions attached to functions, classes, exports, and blocks, not brittle line numbers
+- Low-context session hints: agents load compact `.dmap` entries instead of full YAML logs
+- Local-first: no account, daemon, or hosted service
+- MCP-native: works with any MCP-capable agent using a stdio server
 
-## What You Get
-
-- **Decision memory for agents**: tools can ask why code exists before changing it.
-- **Rejected alternatives preserved**: failed approaches stop getting rediscovered every session.
-- **Code-anchored rationale**: decisions are attached to functions, classes, exports, and blocks, not brittle line numbers.
-- **Low-context session hints**: agents can load compact `.dmap` entries instead of full YAML logs.
-- **Local-first storage**: no account, daemon, or hosted service required.
-- **MCP-native integration**: works with MCP-capable agent tools using a stdio server.
-
-## Benchmarks And Evaluation
+## Benchmarks
 
 Archiva should be judged on outcomes: does the same agent finish more tasks, avoid more regressions, and spend less context/tool budget when it can read and write decision memory?
 
-Public benchmarks that fit Archiva:
+Public benchmarks that fit this question:
 
-- **Terminal-Bench** for end-to-end terminal tasks with task-specific tests.
-- **SWE-bench / SWE-bench Verified** for real GitHub issue-resolution tasks with execution-based grading.
+- **Terminal-Bench** for end-to-end terminal tasks with task-specific tests
+- **SWE-bench / SWE-bench Verified** for real GitHub issue-resolution tasks with execution-based grading
 
-Actual Terminal-Bench smoke result:
+Actual Terminal-Bench smoke result (`csv-to-parquet`, Claude Code 2.1.121, `claude-sonnet-4-6`):
 
-- Terminal-Bench `csv-to-parquet`, Claude Code 2.1.121, `claude-sonnet-4-6`
-- Baseline Claude Code: passed, 128.6s trial time, $0.1197 Claude-reported cost
-- Claude Code + Archiva MCP: passed, 177.6s trial time, $0.2028 Claude-reported cost
-- Archiva MCP was connected, `why` was called before work, `write_decision` recorded `dec_001`, and Terminal-Bench validation passed
+| | passed | trial time | cost |
+|---|---|---|---|
+| Baseline Claude Code | yes | 128.6s | $0.1197 |
+| Claude Code + Archiva MCP | yes | 177.6s | $0.2028 |
 
-See [docs/benchmark-results.md](docs/benchmark-results.md) for the raw run IDs and interpretation.
+Archiva MCP was connected, `why` was called before work, `write_decision` recorded `dec_001`, and Terminal-Bench validation passed. See [docs/benchmark-results.md](docs/benchmark-results.md) for raw run IDs and interpretation.
 
-The smoke result proves Archiva works inside a real benchmark harness. It does not try to show an accuracy lift, because the task had no prior decision memory to exploit. The next benchmark target is a seeded A/B where the treatment repo contains useful `.decisions/` history.
+The smoke result proves Archiva works inside a real benchmark harness. It doesn't show an accuracy lift because the task had no prior decision memory to exploit. The next target is a seeded A/B where the treatment repo contains useful `.decisions/` history.
 
-The clean A/B design is:
+The clean A/B design:
 
 ```text
 same benchmark + same model + same agent + same timeout
 
-baseline:
-  Archiva disabled
-
-treatment:
-  Archiva MCP enabled
-  AGENTS.md includes Archiva instructions
-  tasks use repos with prior decisions when evaluating memory across sessions
+baseline:  Archiva disabled
+treatment: Archiva MCP enabled, AGENTS.md includes Archiva instructions,
+           tasks use repos with prior decisions across sessions
 ```
 
-Useful metrics:
+Useful metrics: resolved task rate, token/tool calls per resolved task, regression count, decision reads/writes per task, stale/orphan decisions after completion.
 
-- resolved task percentage
-- test pass percentage
-- token/tool calls per resolved task
-- regression count
-- decision reads/writes per task
-- stale/orphan decision count after completion
+See [docs/benchmarks.md](docs/benchmarks.md) for the full protocol.
 
-See [docs/benchmarks.md](docs/benchmarks.md) for the full benchmark protocol.
-
-Archiva also includes a small context-footprint benchmark. It does not measure model quality; it measures how compactly Archiva exposes decision memory.
-
-Run the included benchmark:
+Archiva also includes a context-footprint benchmark that measures how compactly it exposes decision memory, not model quality:
 
 ```sh
 npm run benchmark
@@ -112,31 +93,18 @@ session context vs .dlog byte reduction: 58.9%
 average .dmap bytes per decision: 25.3
 ```
 
-Context-footprint interpretation:
-
-- `.dlog` keeps the full decision record for durable memory.
-- `.dmap` gives agents a tiny index for session startup.
-- `why` fetches full detail only when the agent is about to touch a relevant anchor.
-
-This is the main design tradeoff: keep durable reasoning in git, but keep default model context small.
+`.dlog` keeps the full record in git. `.dmap` gives agents a tiny index at session start. `why` fetches the full record only when the agent is about to touch a relevant anchor. That's the core design tradeoff: durable reasoning in git, small default context for the model.
 
 ## Install
 
 ```sh
 npm install -g @jalkarna/archiva
-```
-
-Verify the CLI:
-
-```sh
 archiva --version
 ```
 
-Archiva requires Node.js 20 or newer.
+Requires Node.js 20 or newer.
 
-## Quick Start
-
-Initialize a repository:
+## Quick start
 
 ```sh
 archiva init
@@ -148,13 +116,13 @@ For Claude Code, also register the MCP server:
 claude mcp add -s local archiva -- archiva mcp
 ```
 
-After that, agents can call Archiva through MCP:
+Agents can then call Archiva through MCP:
 
 - before editing, call `why`
 - after a meaningful implementation choice, call `write_decision`
 - when checking drift, call `ghost_check`
 
-The intended agent loop is simple:
+The intended loop:
 
 ```text
 read map -> ask why -> edit code -> write decision -> lint drift
@@ -162,7 +130,7 @@ read map -> ask why -> edit code -> write decision -> lint drift
 
 ## Usage
 
-### Initialize A Project
+### Initialize a project
 
 ```sh
 archiva init
@@ -174,13 +142,13 @@ Creates:
 - `.claude/settings.json` with Archiva hooks and MCP config
 - an `AGENTS.md` decision logging instruction block
 
-By default, decision files are intended to be committed with the code. If a project wants local-only decision logs, run:
+Decision files are committed with the code by default. For local-only logs:
 
 ```sh
 archiva init --gitignore-decisions
 ```
 
-### Check Decision Health
+### Check decision health
 
 ```sh
 archiva status
@@ -188,7 +156,7 @@ archiva status
 
 Shows decision counts and drift/orphan health across the repo.
 
-### Ask Why Code Exists
+### Ask why code exists
 
 By line:
 
@@ -202,7 +170,7 @@ By anchor:
 archiva why src/auth/session.ts fn:processCheckout
 ```
 
-### View Decision History
+### View decision history
 
 ```sh
 archiva history src/auth/session.ts fn:processCheckout
@@ -210,13 +178,13 @@ archiva history src/auth/session.ts fn:processCheckout
 
 Shows the supersession chain for an anchor.
 
-### Lint Decision State
+### Lint decision state
 
 ```sh
 archiva lint
 ```
 
-Rules include:
+Checks for:
 
 - stale decisions when code fingerprints change
 - orphan decisions when anchors disappear
@@ -229,15 +197,15 @@ Safe orphan cleanup:
 archiva lint --fix
 ```
 
-### Run MCP Server
+### Run the MCP server
 
 ```sh
 archiva mcp
 ```
 
-This starts the stdio MCP server. Most users do not run it manually; MCP clients launch it from config.
+Starts the stdio MCP server. You typically don't run this manually; MCP clients launch it from config.
 
-### Run Hooks Manually
+### Run hooks manually
 
 Session context injection:
 
@@ -249,17 +217,13 @@ Re-anchor a file after edits:
 
 ```sh
 ARCHIVA_FILE=src/auth/session.ts archiva hooks post-tool-use
-```
-
-or:
-
-```sh
+# or
 archiva hooks post-tool-use src/auth/session.ts
 ```
 
-## MCP Configuration
+## MCP configuration
 
-Use this config in MCP-capable tools that accept stdio servers:
+For MCP-capable tools that accept stdio servers:
 
 ```json
 {
@@ -281,47 +245,32 @@ For tools that prefer a server object only:
 }
 ```
 
-For project-local Claude settings, `archiva init` writes:
+`archiva init` writes the following to `.claude/settings.json`:
 
 ```json
 {
   "hooks": {
     "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "archiva hooks session-start"
-          }
-        ]
-      }
+      { "hooks": [{ "type": "command", "command": "archiva hooks session-start" }] }
     ],
     "PostToolUse": [
       {
         "matcher": "Write|Edit|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "archiva hooks post-tool-use"
-          }
-        ]
+        "hooks": [{ "type": "command", "command": "archiva hooks post-tool-use" }]
       }
     ]
   },
   "mcpServers": {
-    "archiva": {
-      "command": "archiva",
-      "args": ["mcp"]
-    }
+    "archiva": { "command": "archiva", "args": ["mcp"] }
   }
 }
 ```
 
-## MCP Tools
+## MCP tools
 
 ### `write_decision`
 
-Records a decision for a file and anchor.
+Records a decision for a file and anchor:
 
 ```json
 {
@@ -341,11 +290,11 @@ Records a decision for a file and anchor.
 }
 ```
 
-`supersedes` is optional. When present, it must reference an existing decision id returned by `why`.
+`supersedes` is optional. When present, it must reference an existing decision id from `why`.
 
 ### `why`
 
-Reads decision memory before editing.
+Reads decision memory before editing:
 
 ```json
 {
@@ -354,11 +303,11 @@ Reads decision memory before editing.
 }
 ```
 
-If `anchor` is omitted, Archiva returns all decisions for the file.
+Omit `anchor` to get all decisions for the file.
 
 ### `ghost_check`
 
-Checks a file for stale or orphaned decision state.
+Checks for stale or orphaned decisions:
 
 ```json
 {
@@ -366,22 +315,16 @@ Checks a file for stale or orphaned decision state.
 }
 ```
 
-## File Format
+## File format
 
-For this source file:
-
-```text
-src/auth/session.ts
-```
-
-Archiva writes:
+For `src/auth/session.ts`, Archiva writes:
 
 ```text
 .decisions/src/auth/session.ts.dlog
 .decisions/src/auth/session.ts.dmap
 ```
 
-`.dlog` is the full YAML decision log. `.dmap` is a compact spatial map used for low-token context injection.
+`.dlog` is the full YAML decision log. `.dmap` is a compact spatial map for low-token context injection.
 
 Example `.dmap`:
 
@@ -390,12 +333,12 @@ Example `.dmap`:
 89-94:block:if_version_mismatch:STALE
 ```
 
-## Agent Instructions
+## Agent instructions
 
-Archiva works best when agents are explicitly told to use it:
+Archiva works best when agents are explicitly told to use it. Add this to `AGENTS.md` or your system prompt:
 
 ```md
-## Decision Logging (Archiva)
+## Decision logging (Archiva)
 
 Before modifying a file, read the decision map injected at session start or call the `why` MCP tool.
 
@@ -410,12 +353,12 @@ If changing code with an existing decision:
 - call `write_decision` with `supersedes` if the reasoning changed
 ```
 
-`archiva init` adds a fuller version of this block to `AGENTS.md`.
+`archiva init` adds a fuller version of this to `AGENTS.md`.
 
 ## CI
 
 ```yaml
-name: Decision Health
+name: Decision health
 
 on:
   pull_request:
@@ -443,23 +386,22 @@ npm run build
 node bin/archiva.js --help
 ```
 
-## Current Scope
+## Current scope
 
-Archiva currently supports:
+Supports today:
 
 - TypeScript and JavaScript anchor extraction
-- YAML `.dlog` files
-- compact `.dmap` files
+- YAML `.dlog` files and compact `.dmap` files
 - local re-anchoring
 - linting
 - Claude Code hooks
 - stdio MCP tools
 
-Future hardening work:
+Planned:
 
 - Python anchors
 - richer inline `@decision` comment management
-- first-class setup docs for more IDEs and agent CLIs
+- setup docs for more IDEs and agent CLIs
 
 ## License
 
