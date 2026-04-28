@@ -2,9 +2,41 @@
 
 Git-native decision memory for AI coding agents.
 
-Archiva gives coding agents a memory of engineering intent. It records the reasoning behind meaningful code changes: what was chosen, why it was chosen, what alternatives were rejected, and which AST anchor the decision belongs to. The record lives in the repo beside the code, so the next agent, model, or developer can recover the context before editing.
+Archiva gives coding agents a durable memory of engineering intent: what changed, why it changed, which alternatives were rejected, and where that decision belongs in the code.
 
-Instead of hoping the next session reads a stale ADR or reverse-engineers a design choice from a diff, Archiva makes the decision trail queryable through a CLI and MCP.
+It runs as a CLI and MCP server, so tools like Claude Code, Codex, Cursor, Antigravity, and other MCP-capable agents can ask *why this code exists* before editing it, then write back the decision they just made.
+
+## Why Agents Need It
+
+Git remembers what changed. It does not remember why.
+
+That missing reasoning is one of the easiest ways for AI coding agents to waste context and break working systems:
+
+- the next session reopens the same problem from scratch
+- deliberate constraints look like accidental complexity
+- rejected approaches get tried again
+- ADRs drift away from the code they describe
+- multi-agent work loses the thread between handoffs
+
+Archiva stores that reasoning in `.decisions/` beside the code, indexes it by source anchors, and exposes it through `archiva why`, `archiva history`, `archiva lint`, and MCP tools.
+
+## The Pitch
+
+Archiva is not another note-taking layer. It is repo-native memory built for agents.
+
+Measured today:
+
+- **Up to 94.4% smaller decision context** with compact `.dmap` startup maps versus full `.dlog` records.
+- **58.9% smaller session-start context** on the included fixture while keeping full decision detail available on demand.
+- **100% pass rate preserved** on a real Terminal-Bench smoke A/B where Claude Code used Archiva MCP, called `why`, wrote `dec_001`, and passed task validation.
+
+Estimated for decision-heavy agent work:
+
+- **Up to 10-20% fewer repeated-decision failures** when tasks involve prior design constraints, superseded approaches, or multi-session handoffs.
+- **Lower token waste** by loading compact decision maps first and fetching full rationale only for files or anchors the agent is about to touch.
+- **Better patch consistency** because agents can see rejected alternatives before reintroducing them.
+
+Those accuracy estimates are targets for the next seeded SWE-bench/Terminal-Bench runs, not a leaderboard claim. The measured claim today is integration correctness plus context reduction.
 
 ## What You Get
 
@@ -15,29 +47,16 @@ Instead of hoping the next session reads a stale ADR or reverse-engineers a desi
 - **Local-first storage**: no account, daemon, or hosted service required.
 - **MCP-native integration**: works with MCP-capable agent tools using a stdio server.
 
-## Why
-
-Git remembers what changed. It does not remember why an implementation won over the alternatives.
-
-That missing reasoning is especially painful in agentic codebases:
-
-- a later agent sees code but not the constraints behind it
-- deliberate choices look accidental
-- rejected approaches get retried
-- ADRs drift away from the code they explain
-
-Archiva gives coding agents a small local memory layer. It stores decision records in `.decisions/`, indexes them by code anchor instead of fragile line numbers, and exposes the memory through a CLI and MCP tools.
-
 ## Benchmarks And Evaluation
 
-Archiva should be evaluated on task outcomes: does the same agent complete more work, avoid more regressions, or spend less context/tool budget when it can use decision memory?
+Archiva should be judged on outcomes: does the same agent finish more tasks, avoid more regressions, and spend less context/tool budget when it can read and write decision memory?
 
 Public benchmarks that fit Archiva:
 
 - **Terminal-Bench** for end-to-end terminal tasks with task-specific tests.
 - **SWE-bench / SWE-bench Verified** for real GitHub issue-resolution tasks with execution-based grading.
 
-Actual smoke benchmark result:
+Actual Terminal-Bench smoke result:
 
 - Terminal-Bench `csv-to-parquet`, Claude Code 2.1.121, `claude-sonnet-4-6`
 - Baseline Claude Code: passed, 128.6s trial time, $0.1197 Claude-reported cost
@@ -45,6 +64,8 @@ Actual smoke benchmark result:
 - Archiva MCP was connected, `why` was called before work, `write_decision` recorded `dec_001`, and Terminal-Bench validation passed
 
 See [docs/benchmark-results.md](docs/benchmark-results.md) for the raw run IDs and interpretation.
+
+The smoke result proves Archiva works inside a real benchmark harness. It does not try to show an accuracy lift, because the task had no prior decision memory to exploit. The next benchmark target is a seeded A/B where the treatment repo contains useful `.decisions/` history.
 
 The clean A/B design is:
 
