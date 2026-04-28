@@ -101,6 +101,20 @@ Avoid evaluating Archiva with only a single-turn prompt. Archiva is most useful 
 | Terminal-Bench subset | Claude Code | ... | 20 | TBD | TBD | TBD | MCP enabled in treatment |
 ```
 
+## Completed Smoke Run
+
+An actual Terminal-Bench smoke run is recorded in [benchmark-results.md](benchmark-results.md).
+
+The useful result so far:
+
+- Terminal-Bench `csv-to-parquet`
+- Claude Code 2.1.121 with `claude-sonnet-4-6`
+- Baseline passed
+- Archiva MCP treatment passed
+- Archiva MCP connected, `why` was called, and `write_decision` recorded `dec_001`
+
+This validates integration under a real benchmark harness. It does not yet demonstrate a quality lift, because the task is a one-shot conversion with no useful prior decision memory.
+
 ## Included Context-Footprint Benchmark
 
 The repository includes a small deterministic benchmark:

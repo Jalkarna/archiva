@@ -32,10 +32,19 @@ Archiva gives coding agents a small local memory layer. It stores decision recor
 
 Archiva should be evaluated on task outcomes: does the same agent complete more work, avoid more regressions, or spend less context/tool budget when it can use decision memory?
 
-Recommended public benchmarks:
+Public benchmarks that fit Archiva:
 
-- **SWE-bench / SWE-bench Verified** for real GitHub issue-resolution tasks with execution-based grading.
 - **Terminal-Bench** for end-to-end terminal tasks with task-specific tests.
+- **SWE-bench / SWE-bench Verified** for real GitHub issue-resolution tasks with execution-based grading.
+
+Actual smoke benchmark result:
+
+- Terminal-Bench `csv-to-parquet`, Claude Code 2.1.121, `claude-sonnet-4-6`
+- Baseline Claude Code: passed, 128.6s trial time, $0.1197 Claude-reported cost
+- Claude Code + Archiva MCP: passed, 177.6s trial time, $0.2028 Claude-reported cost
+- Archiva MCP was connected, `why` was called before work, `write_decision` recorded `dec_001`, and Terminal-Bench validation passed
+
+See [docs/benchmark-results.md](docs/benchmark-results.md) for the raw run IDs and interpretation.
 
 The clean A/B design is:
 
@@ -60,7 +69,7 @@ Useful metrics:
 - decision reads/writes per task
 - stale/orphan decision count after completion
 
-See [docs/benchmarks.md](docs/benchmarks.md) for a full benchmark protocol.
+See [docs/benchmarks.md](docs/benchmarks.md) for the full benchmark protocol.
 
 Archiva also includes a small context-footprint benchmark. It does not measure model quality; it measures how compactly Archiva exposes decision memory.
 
