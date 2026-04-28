@@ -39,7 +39,8 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "dev": "tsx src/cli/main.ts"
+    "dev": "tsx src/cli/main.ts",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "commander": "^12.1.0",
