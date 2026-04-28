@@ -28,9 +28,41 @@ That missing reasoning is especially painful in agentic codebases:
 
 Archiva gives coding agents a small local memory layer. It stores decision records in `.decisions/`, indexes them by code anchor instead of fragile line numbers, and exposes the memory through a CLI and MCP tools.
 
-## Benchmarks
+## Benchmarks And Evaluation
 
-Archiva is not claiming model accuracy improvements without a task-specific evaluation. What it can measure directly is context footprint: how much decision state needs to be injected or queried.
+Archiva should be evaluated on task outcomes: does the same agent complete more work, avoid more regressions, or spend less context/tool budget when it can use decision memory?
+
+Recommended public benchmarks:
+
+- **SWE-bench / SWE-bench Verified** for real GitHub issue-resolution tasks with execution-based grading.
+- **Terminal-Bench** for end-to-end terminal tasks with task-specific tests.
+
+The clean A/B design is:
+
+```text
+same benchmark + same model + same agent + same timeout
+
+baseline:
+  Archiva disabled
+
+treatment:
+  Archiva MCP enabled
+  AGENTS.md includes Archiva instructions
+  tasks use repos with prior decisions when evaluating memory across sessions
+```
+
+Useful metrics:
+
+- resolved task percentage
+- test pass percentage
+- token/tool calls per resolved task
+- regression count
+- decision reads/writes per task
+- stale/orphan decision count after completion
+
+See [docs/benchmarks.md](docs/benchmarks.md) for a full benchmark protocol.
+
+Archiva also includes a small context-footprint benchmark. It does not measure model quality; it measures how compactly Archiva exposes decision memory.
 
 Run the included benchmark:
 
@@ -50,7 +82,7 @@ session context vs .dlog byte reduction: 58.9%
 average .dmap bytes per decision: 25.3
 ```
 
-Interpretation:
+Context-footprint interpretation:
 
 - `.dlog` keeps the full decision record for durable memory.
 - `.dmap` gives agents a tiny index for session startup.
