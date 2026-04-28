@@ -24,13 +24,7 @@ Archiva stores reasoning in `.decisions/` beside the code, indexes it by source 
 
 Decision records live in your repo, versioned with the code they describe, queryable by file and anchor. The design is intentionally repo-native: no daemon, no hosted service, no account.
 
-Measured:
-
-- **94.4% smaller decision context** with compact `.dmap` startup maps versus full `.dlog` records
-- **58.9% smaller session-start context** on the included fixture, with full decision detail still available on demand
-- **100% pass rate preserved** on a real Terminal-Bench smoke run where Claude Code used Archiva MCP, called `why`, wrote `dec_001`, and passed task validation
-
-For decision-heavy agent work, the expected gains are fewer repeated-decision failures, lower token waste, and better patch consistency because agents can see rejected alternatives before reintroducing them. Those are targets for the next seeded SWE-bench/Terminal-Bench runs, not current leaderboard claims. The measured claim today is integration correctness and context reduction.
+Archiva keeps full decision detail available when an agent asks for it, while `.dmap` files provide compact startup context for session hooks.
 
 ## Features
 
@@ -40,61 +34,6 @@ For decision-heavy agent work, the expected gains are fewer repeated-decision fa
 - Low-context session hints: agents load compact `.dmap` entries instead of full YAML logs
 - Local-first: no account, daemon, or hosted service
 - MCP-native: works with any MCP-capable agent using a stdio server
-
-## Benchmarks
-
-Archiva should be judged on outcomes: does the same agent finish more tasks, avoid more regressions, and spend less context/tool budget when it can read and write decision memory?
-
-Public benchmarks that fit this question:
-
-- **Terminal-Bench** for end-to-end terminal tasks with task-specific tests
-- **SWE-bench / SWE-bench Verified** for real GitHub issue-resolution tasks with execution-based grading
-
-Actual Terminal-Bench smoke result (`csv-to-parquet`, Claude Code 2.1.121, `claude-sonnet-4-6`):
-
-| | passed | trial time | cost |
-|---|---|---|---|
-| Baseline Claude Code | yes | 128.6s | $0.1197 |
-| Claude Code + Archiva MCP | yes | 177.6s | $0.2028 |
-
-Archiva MCP was connected, `why` was called before work, `write_decision` recorded `dec_001`, and Terminal-Bench validation passed. See [docs/benchmark-results.md](docs/benchmark-results.md) for raw run IDs and interpretation.
-
-The smoke result proves Archiva works inside a real benchmark harness. It doesn't show an accuracy lift because the task had no prior decision memory to exploit. The next target is a seeded A/B where the treatment repo contains useful `.decisions/` history.
-
-The clean A/B design:
-
-```text
-same benchmark + same model + same agent + same timeout
-
-baseline:  Archiva disabled
-treatment: Archiva MCP enabled, AGENTS.md includes Archiva instructions,
-           tasks use repos with prior decisions across sessions
-```
-
-Useful metrics: resolved task rate, token/tool calls per resolved task, regression count, decision reads/writes per task, stale/orphan decisions after completion.
-
-See [docs/benchmarks.md](docs/benchmarks.md) for the full protocol.
-
-Archiva also includes a context-footprint benchmark that measures how compactly it exposes decision memory, not model quality:
-
-```sh
-npm run benchmark
-```
-
-Current fixture result:
-
-```text
-decisions: 3
-full .dlog bytes: 1361
-compact .dmap bytes: 76
-session-start bytes: 559
-.dmap vs .dlog byte reduction: 94.4%
-session context vs .dlog byte reduction: 58.9%
-average .dmap bytes per decision: 25.3
-```
-
-`.dlog` keeps the full record in git. `.dmap` gives agents a tiny index at session start. `why` fetches the full record only when the agent is about to touch a relevant anchor. That's the core design tradeoff: durable reasoning in git, small default context for the model.
-
 ## Install
 
 ```sh

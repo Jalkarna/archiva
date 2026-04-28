@@ -28,9 +28,7 @@
   },
   "files": [
     "bin",
-    "docs",
     "dist",
-    "scripts/benchmark.mjs",
     "schema",
     "README.md"
   ],
@@ -42,7 +40,6 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "dev": "tsx src/cli/main.ts",
-    "benchmark": "node scripts/benchmark.mjs",
     "prepack": "npm run build"
   },
   "dependencies": {
