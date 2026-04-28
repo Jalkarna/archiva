@@ -7,7 +7,7 @@ Archiva records what was chosen, why it was chosen, what was rejected, and which
 ## Install
 
 ```sh
-npm install -g archiva
+npm install -g @jalkarna/archiva
 ```
 
 For local development:

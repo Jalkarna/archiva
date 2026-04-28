@@ -1,5 +1,5 @@
 {
-  "name": "archiva",
+  "name": "@jalkarna/archiva",
   "version": "0.1.0",
   "description": "Git-native decision memory for AI coding agents.",
   "type": "module",
