@@ -1,0 +1,23 @@
+type: object
+required:
+  - file
+  - schema
+  - decisions
+properties:
+  file:
+    type: string
+  schema:
+    const: 1
+  decisions:
+    type: object
+    additionalProperties:
+      type: object
+      required:
+        - id
+        - lines_hint
+        - fingerprint
+        - chose
+        - because
+        - rejected
+        - timestamp
+        - history

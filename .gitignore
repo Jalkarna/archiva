@@ -1,0 +1,31 @@
+node_modules/
+dist/
+coverage/
+.cache/
+.turbo/
+.next/
+build/
+out/
+
+# Local environment
+.env
+.env.*
+
+# Local editor/tool state
+.claude/
+.mcp.json
+.decisions/
+
+# Planning scratch files
+plan/
+task.md
+tasks.md
+TASKS.md
+TODO.md
+notes.md
+NOTES.md
+*.scratch.md
+*.local.md
+
+# Package artifacts
+*.tgz

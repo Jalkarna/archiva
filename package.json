@@ -1,0 +1,59 @@
+{
+  "name": "archiva",
+  "version": "0.1.0",
+  "description": "Git-native decision memory for AI coding agents.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Jalkarna",
+  "homepage": "https://github.com/Jalkarna/archiva#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jalkarna/archiva.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Jalkarna/archiva/issues"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "mcp",
+    "cli",
+    "decision-log",
+    "adr",
+    "codebase",
+    "memory"
+  ],
+  "bin": {
+    "archiva": "bin/archiva.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "schema",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "dev": "tsx src/cli/main.ts"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "diff": "^9.0.0",
+    "js-yaml": "^4.1.0",
+    "ts-morph": "^22.0.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.2",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^20.17.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.5"
+  }
+}
