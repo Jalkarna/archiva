@@ -2,7 +2,18 @@
 
 Git-native decision memory for AI coding agents.
 
-Archiva records the reasoning behind meaningful code changes: what was chosen, why it was chosen, what alternatives were rejected, and which AST anchor the decision belongs to. The record lives in the repo beside the code, so the next agent, model, or developer can recover the context before editing.
+Archiva gives coding agents a memory of engineering intent. It records the reasoning behind meaningful code changes: what was chosen, why it was chosen, what alternatives were rejected, and which AST anchor the decision belongs to. The record lives in the repo beside the code, so the next agent, model, or developer can recover the context before editing.
+
+Instead of hoping the next session reads a stale ADR or reverse-engineers a design choice from a diff, Archiva makes the decision trail queryable through a CLI and MCP.
+
+## What You Get
+
+- **Decision memory for agents**: tools can ask why code exists before changing it.
+- **Rejected alternatives preserved**: failed approaches stop getting rediscovered every session.
+- **Code-anchored rationale**: decisions are attached to functions, classes, exports, and blocks, not brittle line numbers.
+- **Low-context session hints**: agents can load compact `.dmap` entries instead of full YAML logs.
+- **Local-first storage**: no account, daemon, or hosted service required.
+- **MCP-native integration**: works with MCP-capable agent tools using a stdio server.
 
 ## Why
 
@@ -16,6 +27,36 @@ That missing reasoning is especially painful in agentic codebases:
 - ADRs drift away from the code they explain
 
 Archiva gives coding agents a small local memory layer. It stores decision records in `.decisions/`, indexes them by code anchor instead of fragile line numbers, and exposes the memory through a CLI and MCP tools.
+
+## Benchmarks
+
+Archiva is not claiming model accuracy improvements without a task-specific evaluation. What it can measure directly is context footprint: how much decision state needs to be injected or queried.
+
+Run the included benchmark:
+
+```sh
+npm run benchmark
+```
+
+Current fixture result:
+
+```text
+decisions: 3
+full .dlog bytes: 1361
+compact .dmap bytes: 76
+session-start bytes: 559
+.dmap vs .dlog byte reduction: 94.4%
+session context vs .dlog byte reduction: 58.9%
+average .dmap bytes per decision: 25.3
+```
+
+Interpretation:
+
+- `.dlog` keeps the full decision record for durable memory.
+- `.dmap` gives agents a tiny index for session startup.
+- `why` fetches full detail only when the agent is about to touch a relevant anchor.
+
+This is the main design tradeoff: keep durable reasoning in git, but keep default model context small.
 
 ## Install
 
@@ -50,6 +91,12 @@ After that, agents can call Archiva through MCP:
 - before editing, call `why`
 - after a meaningful implementation choice, call `write_decision`
 - when checking drift, call `ghost_check`
+
+The intended agent loop is simple:
+
+```text
+read map -> ask why -> edit code -> write decision -> lint drift
+```
 
 ## Usage
 

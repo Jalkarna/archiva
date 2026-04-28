@@ -70,7 +70,7 @@ async function handleRequest(projectRoot: string, method: string, params: unknow
     return {
       protocolVersion: "2024-11-05",
       capabilities: { tools: {} },
-      serverInfo: { name: "archiva", version: "0.1.1" }
+      serverInfo: { name: "archiva", version: "0.1.2" }
     };
   }
   if (method === "tools/list") {

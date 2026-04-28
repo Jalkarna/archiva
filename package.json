@@ -1,6 +1,6 @@
 {
   "name": "@jalkarna/archiva",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Git-native decision memory for AI coding agents.",
   "type": "module",
   "license": "MIT",
@@ -29,6 +29,7 @@
   "files": [
     "bin",
     "dist",
+    "scripts/benchmark.mjs",
     "schema",
     "README.md"
   ],
@@ -40,6 +41,7 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "dev": "tsx src/cli/main.ts",
+    "benchmark": "node scripts/benchmark.mjs",
     "prepack": "npm run build"
   },
   "dependencies": {
