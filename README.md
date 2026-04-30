@@ -26,6 +26,23 @@ Decision records live in your repo, versioned with the code they describe, query
 
 Archiva keeps full decision detail available when an agent asks for it, while `.dmap` files provide compact startup context for session hooks.
 
+## How it compares
+
+Most AI memory tools are broad recall systems. They store preferences, notes, conversations, embeddings, graph entities, or whole session traces so an agent can remember more across tools.
+
+Archiva is deliberately narrower: it stores **why a specific piece of code exists**. The unit of memory is not a chat message or semantic note. It is a decision record attached to a source file, anchor, line range, fingerprint, and supersession chain.
+
+| Tool category | What it is good at | How Archiva is different |
+|---|---|---|
+| [Supermemory](https://supermemory.ai/docs/supermemory-mcp/introduction) | Cross-app personal memory through a hosted memory API and MCP server. | Archiva is repo-local and git-native. It does not try to remember everything about the user; it records engineering decisions beside the code. |
+| [OpenMemory](https://mem0.ai/openmemory) / Mem0 | Project-scoped coding preferences and automatically retrieved agent context. | Archiva does not infer broad preferences. It captures explicit implementation rationale, rejected alternatives, and decision history for code anchors. |
+| [ICM](https://www.rtk-ai.app/icm.html) | A full memory runtime with hybrid search, temporal decay, hooks, and many MCP tools across editors. | Archiva is small and purpose-built: no vector DB, no semantic memory engine, no global recall layer. It is a decision log and drift checker for repositories. |
+| [Basic Memory](https://docs.basicmemory.com/reference/mcp-tools-reference) | Markdown knowledge management, notes, search, and project knowledge bases. | Archiva is structured around code files and anchors, with `.dlog` and `.dmap` files that can be linted, re-anchored, and committed with source changes. |
+| [Zep / Graphiti MCP](https://www.getzep.com/product/knowledge-graph-mcp/) and graph memory tools | Temporal knowledge graphs, entity relationships, semantic retrieval, and evolving context. | Archiva avoids building a general knowledge graph. It answers a narrower question agents hit constantly: "what decision explains this code, and what should I not repeat?" |
+| ADRs and docs | Human-written architecture records and design notes. | Archiva is closer to the code path agents actually touch. Decisions are queryable by file/anchor, can be marked stale when fingerprints drift, and can be superseded over time. |
+
+Archiva is best used alongside broad memory tools, not necessarily instead of them. Use a general memory layer for user preferences, session summaries, and cross-project recall. Use Archiva for code-level decision provenance that should move with the repository.
+
 ## Features
 
 - Decision memory for agents: tools can ask why code exists before changing it
