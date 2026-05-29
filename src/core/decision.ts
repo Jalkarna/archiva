@@ -10,6 +10,7 @@ export async function writeDecision(projectRoot: string, input: WriteDecisionInp
   const dlog = await loadOrCreateDlog(projectRoot, input.file);
   const fullSourcePath = sourcePath(projectRoot, input.file);
   const source = await fs.readFile(fullSourcePath, "utf8");
+  assertAnchorExists(input.file, source, input.anchor);
   const id = nextDecisionId(dlog);
   const existingToSupersede = input.supersedes ? findDecisionById(dlog.decisions, input.supersedes) : undefined;
   if (input.supersedes && !existingToSupersede) {
@@ -110,6 +111,18 @@ function formatDecision(anchor: string, decision: DecisionRecord): string {
 Chose: ${decision.chose}
 Because: ${decision.because}${rejected}
 Recorded: ${decision.timestamp}${decision.session ? `  Session: ${decision.session}` : ""}${expires}`;
+}
+
+function assertAnchorExists(file: string, source: string, anchor: string): void {
+  const anchors = extractAnchors(file, source);
+  if (Object.prototype.hasOwnProperty.call(anchors, anchor)) return;
+  const available = Object.keys(anchors).sort();
+  const suggestion = available.length
+    ? ` Available anchors in ${file}: ${available.join(", ")}.`
+    : ` No anchors were found in ${file}.`;
+  throw new Error(
+    `Anchor "${anchor}" does not exist in ${file}. A decision recorded against a missing anchor is an immediate orphan.${suggestion}`
+  );
 }
 
 function nextDecisionId(dlog: { decisions: Record<string, DecisionRecord> }): string {

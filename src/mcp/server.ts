@@ -65,12 +65,12 @@ async function handleLine(projectRoot: string, line: string): Promise<void> {
   }
 }
 
-async function handleRequest(projectRoot: string, method: string, params: unknown): Promise<unknown> {
+export async function handleRequest(projectRoot: string, method: string, params: unknown): Promise<unknown> {
   if (method === "initialize") {
     return {
       protocolVersion: "2024-11-05",
       capabilities: { tools: {} },
-      serverInfo: { name: "archiva", version: "0.1.5" }
+      serverInfo: { name: "archiva", version: "0.1.6" }
     };
   }
   if (method === "tools/list") {
