@@ -12,7 +12,7 @@ const program = new Command();
 program
   .name("archiva")
   .description("Decision layer for agentic codebases.")
-  .version("0.1.5");
+  .version("0.1.6");
 
 program
   .command("init")
