@@ -330,17 +330,35 @@ jobs:
           - target: linux-arm64-musl
             runner: ubuntu-24.04-arm
     steps:
-      - name: Install checkout dependencies
-        run: apk add --no-cache git
-
-      - name: Checkout
-        uses: actions/checkout@v7
-
       - name: Install published package on musl
         env:
           ARCHIVA_NATIVE_TARGET: ${{ matrix.target }}
           NPM_CONFIG_INCLUDE: optional
           NPM_CONFIG_IGNORE_SCRIPTS: "false"
         run: |
-          VERSION="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")"
-          node tools/smoke-native-package.mjs --published-spec "@jalkarna/archiva@$VERSION" --expected-version "$VERSION" --target "${{ matrix.target }}"
+          if [ "${GITHUB_REF_NAME#v}" = "$GITHUB_REF_NAME" ]; then
+            echo "Expected tag ref like v0.2.0; got $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          export VERSION
+
+          tmpdir="$(mktemp -d)"
+          cd "$tmpdir"
+          npm init -y >/dev/null
+          npm install --include=optional --ignore-scripts=false "@jalkarna/archiva@$VERSION"
+
+          native_pkg="node_modules/@jalkarna/archiva-${ARCHIVA_NATIVE_TARGET}/package.json"
+          test -f "$native_pkg"
+          node -e '
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            if (pkg.version !== process.env.VERSION) {
+              throw new Error(`Expected native package ${process.argv[1]} version ${process.env.VERSION}, got ${pkg.version}`);
+            }
+          ' "$native_pkg"
+
+          native_bin="node_modules/@jalkarna/archiva-${ARCHIVA_NATIVE_TARGET}/bin/archiva"
+          test -x "$native_bin"
+          actual="$("$native_bin" --version)"
+          test "$actual" = "$VERSION"
