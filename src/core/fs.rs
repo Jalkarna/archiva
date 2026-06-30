@@ -299,11 +299,14 @@ fn create_lock_file(lock_path: &Path, metadata: &str) -> Result<bool> {
     {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
-        Err(source) => {
+        Err(error) => {
+            if error.kind() == io::ErrorKind::PermissionDenied && path_exists(lock_path)? {
+                return Ok(false);
+            }
             return Err(ArchivaError::io(
                 Some(lock_path.to_path_buf()),
                 "create lock file",
-                source,
+                error,
             ));
         }
     };

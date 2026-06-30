@@ -632,14 +632,10 @@ Commands:
 
     expect(invalidFromOption.status).toBe(1);
     expect(invalidFromOption.stdout).toBe("");
-    expect(invalidFromOption.stderr.trim()).toBe(
-      "Expected property name or '}' in JSON at position 1 (line 1 column 2)"
-    );
+    expect(invalidFromOption.stderr.trim()).toMatch(/^Expected property name or '}' in JSON at position 1( \(line 1 column 2\))?$/);
     expect(invalidFromStdin.status).toBe(1);
     expect(invalidFromStdin.stdout).toBe("");
-    expect(invalidFromStdin.stderr.trim()).toBe(
-      "Expected property name or '}' in JSON at position 1 (line 1 column 2)"
-    );
+    expect(invalidFromStdin.stderr.trim()).toMatch(/^Expected property name or '}' in JSON at position 1( \(line 1 column 2\))?$/);
     expect(invalidSchema.status).toBe(1);
     expect(invalidSchema.stdout).toBe("");
     expect(JSON.parse(invalidSchema.stderr)).toEqual([

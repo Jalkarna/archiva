@@ -38,6 +38,50 @@ async function assertNativeExecutable(file, target) {
   }
 }
 
+async function pathExists(file) {
+  try {
+    await fs.access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function powershellSingleQuote(value) {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+async function rewriteWindowsNpmShims(output) {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const nodeModules = path.resolve(packageRoot, "..", "..");
+  const candidates = [
+    path.join(nodeModules, ".bin", "archiva.cmd"),
+    path.join(nodeModules, ".bin", "archiva.ps1"),
+    path.join(nodeModules, "..", "archiva.cmd"),
+    path.join(nodeModules, "..", "archiva.ps1")
+  ];
+  const absoluteOutput = path.resolve(output);
+  const cmdShim = [
+    "@ECHO off",
+    `"${absoluteOutput}" %*`,
+    "EXIT /b %ERRORLEVEL%"
+  ].join("\r\n") + "\r\n";
+  const ps1Shim = [
+    `& ${powershellSingleQuote(absoluteOutput)} @args`,
+    "exit $LASTEXITCODE"
+  ].join("\r\n") + "\r\n";
+
+  for (const candidate of candidates) {
+    if (!(await pathExists(candidate))) {
+      continue;
+    }
+    await fs.writeFile(candidate, candidate.endsWith(".ps1") ? ps1Shim : cmdShim);
+  }
+}
+
 function resolveNativePackage(target) {
   try {
     return requireFromPackage.resolve(`${target.packageName}/package.json`, { paths: [packageRoot] });
@@ -83,6 +127,7 @@ async function installNative() {
   if (process.platform !== "win32") {
     await fs.chmod(output, 0o755);
   }
+  await rewriteWindowsNpmShims(output);
 
   const result = spawnSync(output, ["--version"], { encoding: "utf8" });
   if (result.error || result.status !== 0) {
