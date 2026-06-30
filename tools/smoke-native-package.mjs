@@ -359,7 +359,7 @@ async function assertInstalledCliBehavior(prefix, expectedVersion) {
     because: "package smoke must prove real CLI behavior",
     rejected: [{ approach: "version-only smoke", reason: "does not exercise storage or source parsing" }]
   };
-  const write = runInstalled(prefix, ["write-decision", "--json", JSON.stringify(decision)], { cwd: project });
+  const write = runInstalled(prefix, ["write-decision"], { cwd: project, input: JSON.stringify(decision) });
   if (!write.includes("Recorded dec_001")) {
     throw new Error(`Installed write-decision returned '${write}'.`);
   }

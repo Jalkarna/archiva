@@ -124,11 +124,11 @@ jobs:
       - name: Typecheck
         run: npm run check
 
-      - name: Test
-        run: npm test
-
       - name: Build
         run: npm run build
+
+      - name: Test
+        run: npm test
 
       - name: Native differential
         run: npm run differential:release

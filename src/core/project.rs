@@ -1131,7 +1131,7 @@ mod tests {
         let lock_path = decision_lock_path(&root, &dlog.file);
         fs::write(
             &lock_path,
-            "version=1\npid=999\ntoken=stale\ncommand=other\ntimestamp=1970-01-01T00:00:00.000Z\n",
+            "version=1\ntoken=stale\ncommand=other\ntimestamp=1970-01-01T00:00:00.000Z\n",
         )
         .unwrap();
 
@@ -1555,7 +1555,7 @@ mod tests {
         let lock_path = decision_lock_path(&root, &dlog.file);
         fs::write(
             &lock_path,
-            "version=1\npid=999\ntoken=stale\ncommand=other\ntimestamp=1970-01-01T00:00:00.000Z\n",
+            "version=1\ntoken=stale\ncommand=other\ntimestamp=1970-01-01T00:00:00.000Z\n",
         )
         .unwrap();
 

@@ -448,7 +448,7 @@ mod tests {
         fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
         fs::write(
             &lock_path,
-            "version=1\npid=999\ntoken=stale\ncommand=other\ntimestamp=2026-06-26T20:00:00.000Z\n",
+            "version=1\ntoken=stale\ncommand=other\ntimestamp=2026-06-26T20:00:00.000Z\n",
         )
         .unwrap();
 

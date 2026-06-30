@@ -384,9 +384,9 @@ mod tests {
                 .as_path(),
         )
         .unwrap_err();
-        assert!(outside
-            .user_message()
-            .contains("is not under /repo/.decisions"));
+        let message = outside.user_message().replace('\\', "/");
+        assert!(message.contains("is not under"));
+        assert!(message.contains("/repo/.decisions"));
     }
 
     #[test]
