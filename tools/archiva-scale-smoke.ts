@@ -198,7 +198,7 @@ if (corpusRequested) {
     selection.language === "typescript"
       ? await runCorpusScale(typescriptRuntime, selection.corpusRoot, selection.selected, corpusConfig, true)
       : undefined;
-  corpusOk = typescriptCorpus === undefined || scaleParityMatches(typescriptCorpus, rustCorpus);
+  corpusOk = typescriptCorpus === undefined || corpusScaleParityMatches(typescriptCorpus, rustCorpus);
   corpus = {
     corpusRoot: selection.corpusRoot,
     language: selection.language,
@@ -713,11 +713,32 @@ function scaleParityMatches(left: ScaleRunResult, right: ScaleRunResult): boolea
   );
 }
 
+function corpusScaleParityMatches(left: ScaleRunResult, right: ScaleRunResult): boolean {
+  return (
+    JSON.stringify(left.parityArtifacts) === JSON.stringify(right.parityArtifacts) &&
+    JSON.stringify(left.artifactSummary) === JSON.stringify(right.artifactSummary) &&
+    JSON.stringify(left.semanticSummary) === JSON.stringify(right.semanticSummary) &&
+    JSON.stringify(comparableCommandOutcomes(left.commandSummaries)) ===
+      JSON.stringify(comparableCommandOutcomes(right.commandSummaries))
+  );
+}
+
 function comparableCommandSummaries(commandSummaries: Record<string, CommandSummary>): Record<string, Omit<CommandSummary, "peakRss">> {
   const output: Record<string, Omit<CommandSummary, "peakRss">> = {};
   for (const key of Object.keys(commandSummaries).sort()) {
     const { peakRss: _peakRss, ...summary } = commandSummaries[key];
     output[key] = summary;
+  }
+  return output;
+}
+
+function comparableCommandOutcomes(
+  commandSummaries: Record<string, CommandSummary>
+): Record<string, Pick<CommandSummary, "status" | "stderrBytes" | "stderrHash">> {
+  const output: Record<string, Pick<CommandSummary, "status" | "stderrBytes" | "stderrHash">> = {};
+  for (const key of Object.keys(commandSummaries).sort()) {
+    const { status, stderrBytes, stderrHash } = commandSummaries[key];
+    output[key] = { status, stderrBytes, stderrHash };
   }
   return output;
 }
