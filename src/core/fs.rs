@@ -300,7 +300,7 @@ fn create_lock_file(lock_path: &Path, metadata: &str) -> Result<bool> {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
         Err(error) => {
-            if error.kind() == io::ErrorKind::PermissionDenied && path_exists(lock_path)? {
+            if lock_create_error_is_contention(lock_path, &error)? {
                 return Ok(false);
             }
             return Err(ArchivaError::io(
@@ -328,6 +328,13 @@ fn create_lock_file(lock_path: &Path, metadata: &str) -> Result<bool> {
     result?;
 
     Ok(true)
+}
+
+fn lock_create_error_is_contention(lock_path: &Path, error: &io::Error) -> Result<bool> {
+    if error.kind() == io::ErrorKind::PermissionDenied && path_exists(lock_path)? {
+        return Ok(true);
+    }
+    Ok(cfg!(windows) && error.raw_os_error() == Some(5))
 }
 
 fn recover_stale_lock(lock_path: &Path, contender_timestamp: &str) -> Result<bool> {
