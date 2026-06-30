@@ -1,6 +1,6 @@
 {
   "name": "@jalkarna/archiva",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "Git-native decision memory for AI coding agents.",
   "type": "module",
   "license": "MIT",
@@ -24,38 +24,67 @@
     "memory"
   ],
   "bin": {
-    "archiva": "bin/archiva.js"
+    "archiva": "dist-native/archiva.exe"
   },
   "files": [
-    "bin",
-    "dist",
+    "dist-native/archiva.exe",
+    "dist-native/package.json",
+    "dist-native/package-manifest.json",
     "schema",
-    "README.md"
+    "tools/install-native.mjs",
+    "tools/native-targets.mjs",
+    "README.md",
+    "LICENSE"
   ],
-  "engines": {
-    "node": ">=20"
-  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
+    "build": "npm run build:rust && npm run build:ts",
+    "build:rust": "cargo build --release && node tools/stage-native-package.mjs --copy-local",
+    "build:ts": "tsc -p tsconfig.json && node tools/write-dist-bin-shim.mjs",
+    "check": "npm run check:ts && npm run check:rust && npm run check:package",
+    "check:rust": "cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --quiet",
+    "check:package": "node tools/validate-native-package-metadata.mjs && node tools/stage-native-package.mjs --meta-only && node tools/validate-native-package-metadata.mjs --meta-package",
+    "check:ts": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --dir test",
     "dev": "tsx src/cli/main.ts",
-    "prepack": "npm run build"
+    "baseline:ts": "tsx tools/archiva-ts-baseline.ts",
+    "baseline:rust": "tsx tools/archiva-rust-baseline.ts",
+    "benchmark:compare": "ARCHIVA_RUST_BIN=target/release/archiva tsx tools/archiva-benchmark-compare.ts",
+    "differential": "tsx tools/archiva-differential.ts",
+    "differential:release": "ARCHIVA_RUST_BIN=target/release/archiva tsx tools/archiva-differential.ts",
+    "property:soak": "cargo test --quiet --lib property_extended_serialization_and_diff -- --ignored",
+    "scale:corpus": "ARCHIVA_RUST_BIN=dist-native/archiva ARCHIVA_SCALE_CORPUS=1 tsx tools/archiva-scale-smoke.ts",
+    "scale:corpus:rust": "ARCHIVA_SCALE_CORPUS_LANGUAGE=rust npm run scale:corpus",
+    "scale:smoke": "ARCHIVA_RUST_BIN=dist-native/archiva tsx tools/archiva-scale-smoke.ts",
+    "stress:soak": "ARCHIVA_STRESS_FILES=10 ARCHIVA_STRESS_FUNCTIONS=6 ARCHIVA_STRESS_CYCLES=30 npm run stress:rust-port",
+    "stress:rust-port": "ARCHIVA_RUST_BIN=target/release/archiva tsx tools/archiva-stress-rust-port.ts",
+    "smoke:package": "node tools/smoke-native-package.mjs",
+    "prepack": "node tools/stage-native-package.mjs --meta-only && node tools/validate-native-package-metadata.mjs --meta-package",
+    "postinstall": "node tools/install-native.mjs"
   },
-  "dependencies": {
-    "commander": "^12.1.0",
-    "diff": "^9.0.0",
-    "js-yaml": "^4.1.0",
-    "ts-morph": "^22.0.0",
-    "zod": "^3.24.1"
+  "engines": {
+    "node": ">=20.11"
+  },
+  "optionalDependencies": {
+    "@jalkarna/archiva-linux-x64-gnu": "0.2.0",
+    "@jalkarna/archiva-linux-x64-musl": "0.2.0",
+    "@jalkarna/archiva-linux-arm64-gnu": "0.2.0",
+    "@jalkarna/archiva-linux-arm64-musl": "0.2.0",
+    "@jalkarna/archiva-darwin-x64": "0.2.0",
+    "@jalkarna/archiva-darwin-arm64": "0.2.0",
+    "@jalkarna/archiva-win32-x64-msvc": "0.2.0"
   },
   "devDependencies": {
     "@types/diff": "^7.0.2",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.17.10",
+    "commander": "^12.1.0",
+    "diff": "^9.0.0",
+    "js-yaml": "^4.1.0",
     "picomatch": "^4.0.4",
+    "ts-morph": "^22.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vitest": "^4.1.5"
+    "vitest": "^4.1.5",
+    "zod": "^3.24.1"
   }
 }

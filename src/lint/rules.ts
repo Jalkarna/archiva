@@ -1,11 +1,15 @@
 import fs from "node:fs/promises";
 import { extractAnchors } from "../core/anchor.js";
+import {
+  clearRecoveredStatus,
+  isFingerprintStale,
+  markStale
+} from "../core/decision-status.js";
 import { loadDlog, writeDlog } from "../core/dlog.js";
 import { writeDmap } from "../core/dmap.js";
 import { pathExists } from "../core/fs.js";
-import { fingerprint, getLines } from "../core/fingerprint.js";
 import { sourcePath } from "../core/paths.js";
-import { absoluteToRelative, decisionFileToSource, listDlogFiles, listSourceFiles } from "../core/scan.js";
+import { absoluteToRelative, decisionFileToSource, listDlogFiles, listLintSourceFiles } from "../core/scan.js";
 import type { DlogFile, LintIssue } from "../core/types.js";
 
 export async function lintProject(projectRoot: string, options: { fix?: boolean } = {}): Promise<LintIssue[]> {
@@ -33,12 +37,6 @@ async function lintDlog(projectRoot: string, dlog: DlogFile, options: { fix?: bo
   const anchors = sourceExists ? extractAnchors(dlog.file, source) : {};
   let changed = false;
 
-  const supersededIds = new Set(
-    Object.values(dlog.decisions)
-      .map((decision) => decision.supersedes)
-      .filter((id): id is string => Boolean(id))
-  );
-
   for (const [anchor, decision] of Object.entries(dlog.decisions)) {
     if (!anchors[anchor]) {
       issues.push({
@@ -56,8 +54,10 @@ async function lintDlog(projectRoot: string, dlog: DlogFile, options: { fix?: bo
       continue;
     }
 
-    const currentFingerprint = fingerprint(getLines(source, decision.lines_hint));
-    if (currentFingerprint !== decision.fingerprint || decision.status === "STALE") {
+    const fingerprintMismatch = sourceExists && isFingerprintStale(source, decision);
+    const wasAlreadyStale = decision.status === "STALE";
+
+    if (fingerprintMismatch) {
       issues.push({
         rule: "arc/stale",
         severity: "error",
@@ -66,22 +66,21 @@ async function lintDlog(projectRoot: string, dlog: DlogFile, options: { fix?: bo
         message: `${anchor} code fingerprint differs from recorded decision`,
         fixable: false
       });
-      if (decision.status !== "STALE") {
-        decision.status = "STALE";
-        decision.stale_since = new Date().toISOString();
+      if (!wasAlreadyStale) {
+        markStale(decision);
         changed = true;
+      } else {
+        issues.push({
+          rule: "arc/supersede",
+          severity: "error",
+          file: dlog.file,
+          anchor,
+          message: `${anchor} is stale and has not been superseded`,
+          fixable: false
+        });
       }
-    }
-
-    if (decision.status === "STALE" && !supersededIds.has(decision.id)) {
-      issues.push({
-        rule: "arc/supersede",
-        severity: "error",
-        file: dlog.file,
-        anchor,
-        message: `${anchor} is stale and has not been superseded`,
-        fixable: false
-      });
+    } else if (clearRecoveredStatus(decision)) {
+      changed = true;
     }
   }
 
@@ -97,7 +96,7 @@ async function lintComplexUndecided(projectRoot: string, dlogs: DlogFile[]): Pro
   const issues: LintIssue[] = [];
   const decisionsByFile = new Map(dlogs.map((dlog) => [dlog.file, new Set(Object.keys(dlog.decisions))]));
 
-  for (const absoluteFile of await listSourceFiles(projectRoot)) {
+  for (const absoluteFile of await listLintSourceFiles(projectRoot)) {
     const file = absoluteToRelative(projectRoot, absoluteFile);
     const content = await fs.readFile(absoluteFile, "utf8");
     const anchors = extractAnchors(file, content);

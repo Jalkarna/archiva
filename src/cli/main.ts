@@ -1,6 +1,8 @@
 import { Command } from "commander";
 import { history, why, whyForLine, writeDecision } from "../core/decision.js";
 import { postToolUse } from "../core/reanchor.js";
+import { writeDecisionInputSchema } from "../core/schemas.js";
+import { ARCHIVA_VERSION } from "../core/version.js";
 import { initProject } from "./init.js";
 import { status } from "./status.js";
 import { sessionStart } from "../hooks/session-start.js";
@@ -12,7 +14,7 @@ const program = new Command();
 program
   .name("archiva")
   .description("Decision layer for agentic codebases.")
-  .version("0.1.6");
+  .version(ARCHIVA_VERSION);
 
 program
   .command("init")
@@ -93,7 +95,7 @@ program
   .option("--json <json>", "write_decision input JSON")
   .action(async (options: { json?: string }) => {
     const raw = options.json ?? (await readStdin());
-    const input = JSON.parse(raw);
+    const input = writeDecisionInputSchema.parse(JSON.parse(raw));
     const decision = await writeDecision(process.cwd(), input);
     await print(Promise.resolve(`Recorded ${decision.id}.`));
   });

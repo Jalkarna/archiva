@@ -17,6 +17,47 @@ describe("cli flows", () => {
     await expect(fs.stat(path.join(root, ".gitignore"))).rejects.toThrow();
   });
 
+  it("merges Archiva hooks into existing Claude settings without removing other hooks", async () => {
+    const root = await tempProject();
+    await fs.mkdir(path.join(root, ".claude"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, ".claude", "settings.json"),
+      JSON.stringify(
+        {
+          hooks: {
+            SessionStart: [{ hooks: [{ type: "command", command: "echo custom-session" }] }],
+            PostToolUse: [
+              {
+                matcher: "Write|Edit|MultiEdit",
+                hooks: [{ type: "command", command: "echo custom-post" }]
+              }
+            ]
+          }
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    await initProject(root);
+    const settings = JSON.parse(await fs.readFile(path.join(root, ".claude", "settings.json"), "utf8")) as {
+      hooks: {
+        SessionStart: Array<{ hooks: Array<{ command: string }> }>;
+        PostToolUse: Array<{ matcher?: string; hooks: Array<{ command: string }> }>;
+      };
+    };
+
+    const sessionCommands = settings.hooks.SessionStart.flatMap((group) => group.hooks.map((hook) => hook.command));
+    expect(sessionCommands).toContain("echo custom-session");
+    expect(sessionCommands).toContain("archiva hooks session-start");
+
+    const postGroup = settings.hooks.PostToolUse.find((group) => group.matcher === "Write|Edit|MultiEdit");
+    const postCommands = postGroup?.hooks.map((hook) => hook.command) ?? [];
+    expect(postCommands).toContain("echo custom-post");
+    expect(postCommands).toContain("archiva hooks post-tool-use");
+  });
+
   it("prints status and session context from decisions", async () => {
     const root = await tempProject();
     await fs.mkdir(path.join(root, "src"), { recursive: true });

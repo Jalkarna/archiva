@@ -58,7 +58,23 @@ npm install -g @jalkarna/archiva
 archiva --version
 ```
 
-Requires Node.js 20 or newer.
+The installed CLI is a native Rust binary. Node.js is only required when
+installing through npm or working on the TypeScript compatibility harness in
+this repository; the `archiva` command itself runs as a native binary after
+installation.
+
+The npm package selects a platform-specific native package at install time:
+
+| Platform | Architectures |
+|---|---|
+| Linux glibc | x64, arm64 |
+| Linux musl | x64, arm64 |
+| macOS | x64, arm64 |
+| Windows MSVC | x64 |
+
+Install with optional dependencies and lifecycle scripts enabled. npm options
+such as `--omit=optional` or `--ignore-scripts` prevent the native binary from
+being selected.
 
 ## Quick start
 
@@ -152,6 +168,17 @@ Safe orphan cleanup:
 ```sh
 archiva lint --fix
 ```
+
+### Compatibility notes
+
+The native Rust CLI intentionally validates project-relative file paths more
+strictly than the original TypeScript implementation. Common tool spellings
+such as `./src/a.ts`, `.//src/a.ts`, and `src\a.ts` are normalized to the same
+decision identity, while traversal, internal dot segments, absolute paths,
+Windows drive or UNC prefixes, reserved Windows device names, Windows-invalid
+characters, and trailing dot or space segments are rejected. This keeps
+decision reads and writes inside the project and makes stored paths portable
+across platforms.
 
 ### Run the MCP server
 
@@ -336,17 +363,73 @@ jobs:
 
 ```sh
 npm install
+npm run build:rust
 npm run check
 npm test
 npm run build
-node bin/archiva.js --help
+target/release/archiva --help
 ```
+
+Development requires Rust 1.96.0 with `rustfmt`.
+
+CI runs the Rust crate on Ubuntu, macOS, and Windows, then builds and smoke
+tests the npm native package matrix. Release publishing runs heavy validation
+before publishing native packages, publishes the meta package only after those
+native packages are available, and smoke tests the published install across the
+supported glibc, musl, macOS, and Windows targets.
+
+### Heavy validation
+
+These commands are intended for release or port-validation work rather than the
+fast inner loop:
+
+```sh
+npm run differential:release
+npm run stress:rust-port
+npm run benchmark:compare
+npm run scale:smoke
+ARCHIVA_SCALE_CORPUS_ROOT=/path/to/repo npm run scale:corpus
+```
+
+`scale:smoke` generates synthetic projects for a larger Rust-only profile and
+a smaller TypeScript-vs-Rust artifact parity profile. Tune the main profile
+with `ARCHIVA_SCALE_FILES`, `ARCHIVA_SCALE_DECISIONS`,
+`ARCHIVA_SCALE_DECISIONS_PER_FILE`, and `ARCHIVA_SCALE_MUTATE_FILES`. Tune the
+parity profile with `ARCHIVA_SCALE_PARITY_FILES`,
+`ARCHIVA_SCALE_PARITY_DECISIONS`,
+`ARCHIVA_SCALE_PARITY_DECISIONS_PER_FILE`, and
+`ARCHIVA_SCALE_PARITY_MUTATE_FILES`. Increasing decisions per file exercises
+dense `.dlog` and `.dmap` rewrites without requiring the same number of source
+files.
+
+Set `ARCHIVA_SCALE_SEEDED=1` to add a Rust-only seeded read/reanchor scale
+profile. Seeded mode writes compatible synthetic `.dlog` and `.dmap` artifacts
+directly, then measures the native binary on `post-tool-use`, `lint`, `status`,
+`hooks session-start`, and `why`. Tune it with `ARCHIVA_SCALE_SEEDED_FILES`,
+`ARCHIVA_SCALE_SEEDED_DECISIONS`,
+`ARCHIVA_SCALE_SEEDED_DECISIONS_PER_FILE`,
+`ARCHIVA_SCALE_SEEDED_MUTATE_FILES`, and
+`ARCHIVA_SCALE_COMMAND_MAX_BUFFER_MB`.
+
+The release workflow uses bounded defaults so publishing remains practical.
+Large seeded profiles and ignored soak tests are manual release evidence when
+raising confidence beyond the normal publish gate.
+
+`scale:corpus` copies a bounded subset of real source files into temporary
+projects, writes decisions, mutates files, runs hooks, lint, status,
+session-start, and why, then validates the resulting `.dlog` and `.dmap`
+artifacts. TypeScript/JavaScript corpora compare the TypeScript baseline
+against Rust. Rust corpora run the native Rust binary only, because the
+TypeScript baseline cannot parse Rust source. Tune it with
+`ARCHIVA_SCALE_CORPUS_FILES`, `ARCHIVA_SCALE_CORPUS_DECISIONS`,
+`ARCHIVA_SCALE_CORPUS_MUTATE_FILES`, and `ARCHIVA_SCALE_CORPUS_LANGUAGE`
+(`auto`, `typescript`, or `rust`).
 
 ## Current scope
 
 Supports today:
 
-- TypeScript and JavaScript anchor extraction
+- TypeScript, JavaScript, and Rust anchor extraction
 - YAML `.dlog` files and compact `.dmap` files
 - local re-anchoring
 - linting

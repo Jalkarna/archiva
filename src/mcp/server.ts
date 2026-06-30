@@ -1,30 +1,21 @@
 import readline from "node:readline";
 import { z } from "zod";
 import { why, writeDecision } from "../core/decision.js";
+import { writeDecisionInputSchema } from "../core/schemas.js";
+import { ARCHIVA_VERSION } from "../core/version.js";
 import { lintProject } from "../lint/rules.js";
 
-const writeDecisionSchema = z.object({
-  file: z.string(),
-  anchor: z.string(),
-  lines: z.tuple([z.number().int(), z.number().int()]),
-  chose: z.string(),
-  because: z.string(),
-  rejected: z.array(z.object({ approach: z.string(), reason: z.string() })),
-  expires_if: z.string().optional(),
-  supersedes: z.string().optional()
-});
-
 const whySchema = z.object({
-  file: z.string(),
-  anchor: z.string().optional()
+  file: z.string().min(1),
+  anchor: z.string().min(1).optional()
 });
 
 const ghostCheckSchema = z.object({
-  file: z.string()
+  file: z.string().min(1)
 });
 
 export async function startMcpServer(projectRoot: string): Promise<void> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+  const rl = readline.createInterface({ input: process.stdin, terminal: false });
   let queue = Promise.resolve();
   rl.on("line", (line) => {
     if (!line.trim()) return;
@@ -33,9 +24,9 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
 }
 
 async function handleLine(projectRoot: string, line: string): Promise<void> {
-  let request: { id?: string | number; method?: string; params?: unknown };
+  let request: { id?: string | number | null; method?: string; params?: unknown };
   try {
-    request = JSON.parse(line) as { id?: string | number; method?: string; params?: unknown };
+    request = JSON.parse(line) as { id?: string | number | null; method?: string; params?: unknown };
   } catch (error) {
     respond({
       jsonrpc: "2.0",
@@ -48,7 +39,16 @@ async function handleLine(projectRoot: string, line: string): Promise<void> {
     return;
   }
 
-  if (!request.method) return;
+  if (!request.method) {
+    if (request.id !== undefined && request.id !== null) {
+      respond({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: { code: -32600, message: "Missing method" }
+      });
+    }
+    return;
+  }
   if (request.method.startsWith("notifications/")) return;
   try {
     const result = await handleRequest(projectRoot, request.method, request.params);
@@ -70,7 +70,7 @@ export async function handleRequest(projectRoot: string, method: string, params:
     return {
       protocolVersion: "2024-11-05",
       capabilities: { tools: {} },
-      serverInfo: { name: "archiva", version: "0.1.6" }
+      serverInfo: { name: "archiva", version: ARCHIVA_VERSION }
     };
   }
   if (method === "tools/list") {
@@ -85,7 +85,7 @@ export async function handleRequest(projectRoot: string, method: string, params:
 
 async function callTool(projectRoot: string, name: string, args: unknown): Promise<unknown> {
   if (name === "write_decision") {
-    const input = writeDecisionSchema.parse(args);
+    const input = writeDecisionInputSchema.parse(args);
     const decision = await writeDecision(projectRoot, input);
     return textResult(`Recorded ${decision.id}.`);
   }

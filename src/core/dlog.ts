@@ -3,12 +3,8 @@ import yaml from "js-yaml";
 import { z } from "zod";
 import { ensureDirFor, pathExists } from "./fs.js";
 import { dlogPath, normalizeRelativePath } from "./paths.js";
+import { rejectedAlternativeSchema } from "./schemas.js";
 import type { DecisionRecord, DlogFile } from "./types.js";
-
-const rejectedSchema = z.object({
-  approach: z.string().min(1),
-  reason: z.string().min(1)
-});
 
 const historySchema = z.object({
   id: z.string().min(1),
@@ -24,7 +20,7 @@ const decisionSchema = z.object({
   fingerprint: z.string().min(1),
   chose: z.string().min(1),
   because: z.string().min(1),
-  rejected: z.array(rejectedSchema),
+  rejected: z.array(rejectedAlternativeSchema),
   expires_if: z.string().optional(),
   session: z.string().optional(),
   timestamp: z.string().min(1),

@@ -107,4 +107,23 @@ describe("mcp server", () => {
     await expect(handleRequest(root, "tools/call", { name: "nope", arguments: {} })).rejects.toThrow(/Unknown tool/);
     await expect(handleRequest(root, "does/not/exist", {})).rejects.toThrow(/Unsupported MCP method/);
   });
+
+  it("rejects write_decision input that fails shared validation", async () => {
+    const root = await tempProject();
+    await fs.writeFile(path.join(root, "src/session.ts"), "export function processCheckout() {\n  return \"ok\";\n}\n", "utf8");
+
+    await expect(
+      handleRequest(root, "tools/call", {
+        name: "write_decision",
+        arguments: {
+          file: "src/session.ts",
+          anchor: "fn:processCheckout",
+          lines: [1, 3],
+          chose: "",
+          because: "fixture",
+          rejected: []
+        }
+      })
+    ).rejects.toThrow();
+  });
 });
