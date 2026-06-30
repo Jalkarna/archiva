@@ -332,10 +332,13 @@ fn create_lock_file(lock_path: &Path, metadata: &str) -> Result<bool> {
 }
 
 fn lock_create_error_is_contention(lock_path: &Path, error: &io::Error) -> Result<bool> {
+    if cfg!(windows) && error.raw_os_error() == Some(5) {
+        return Ok(true);
+    }
     if error.kind() == io::ErrorKind::PermissionDenied && path_exists(lock_path)? {
         return Ok(true);
     }
-    Ok(cfg!(windows) && error.raw_os_error() == Some(5))
+    Ok(false)
 }
 
 fn recover_stale_lock(lock_path: &Path, contender_timestamp: &str) -> Result<bool> {
@@ -411,10 +414,13 @@ fn lock_file_read_is_recoverable(
 }
 
 fn lock_read_error_is_contention(lock_path: &Path, error: &io::Error) -> Result<bool> {
+    if cfg!(windows) && error.raw_os_error() == Some(5) {
+        return Ok(true);
+    }
     if error.kind() == io::ErrorKind::PermissionDenied && path_exists(lock_path)? {
         return Ok(true);
     }
-    Ok(cfg!(windows) && error.raw_os_error() == Some(5))
+    Ok(false)
 }
 
 fn lock_is_recoverable(lock_path: &Path, content: &str, contender_timestamp: &str) -> Result<bool> {
@@ -818,9 +824,10 @@ mod tests {
     use super::{
         acquire_file_lock, acquire_file_lock_now, acquire_stale_recovery_lock, atomic_write_text,
         atomic_write_text_with_test_fault, ensure_parent_dir, list_files, list_storage_files,
-        lock_read_error_is_contention, path_exists, read_text_file_with_limit, read_text_if_exists,
-        read_text_if_exists_with_limit, recover_stale_lock, stale_recovery_lock_path,
-        AtomicWriteTestFault, AtomicWriteTestStage, LOCK_METADATA_MAX_BYTES,
+        lock_create_error_is_contention, lock_read_error_is_contention, path_exists,
+        read_text_file_with_limit, read_text_if_exists, read_text_if_exists_with_limit,
+        recover_stale_lock, stale_recovery_lock_path, AtomicWriteTestFault, AtomicWriteTestStage,
+        LOCK_METADATA_MAX_BYTES,
     };
     use crate::core::dlog::parse_dlog_yaml;
     use std::fs;
@@ -912,6 +919,24 @@ mod tests {
             &io::Error::from(io::ErrorKind::PermissionDenied)
         )
         .unwrap());
+        assert!(lock_create_error_is_contention(
+            &lock_path,
+            &io::Error::from(io::ErrorKind::PermissionDenied)
+        )
+        .unwrap());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classifies_windows_raw_access_denied_as_contention_without_path_probe() {
+        let root = unique_temp_dir("archiva-fs-lock-read-raw-access-denied");
+        let lock_path = root.join(".decisions").join("src").join("a.ts.lock");
+        let error = io::Error::from_raw_os_error(5);
+
+        assert!(lock_read_error_is_contention(&lock_path, &error).unwrap());
+        assert!(lock_create_error_is_contention(&lock_path, &error).unwrap());
 
         let _ = fs::remove_dir_all(root);
     }
