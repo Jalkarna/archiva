@@ -271,6 +271,7 @@ pub fn post_tool_use(project_root: &Path, file: &RelativePath) -> Result<String>
     let old_git_file = moved_from.as_ref().unwrap_or(file);
     let old_content =
         read_git_head_file(project_root, old_git_file).unwrap_or_else(|_| new_content.clone());
+    let using_current_content_fallback = old_content == new_content;
     let line_changes = diff_lines(&old_content, &new_content);
 
     let lock_timestamp = now_utc_millis()
@@ -284,15 +285,21 @@ pub fn post_tool_use(project_root: &Path, file: &RelativePath) -> Result<String>
             let mut stale = 0_usize;
             let mut orphan = 0_usize;
             for (anchor, decision) in dlog.decisions.iter_mut() {
+                let shifted_range =
+                    apply_line_changes_to_range(&line_changes, decision.lines_hint.clone());
                 let anchor_exists = if let Some(info) = extraction.anchors.get_str(anchor) {
-                    decision.lines_hint = LineRange {
-                        start: info.start,
-                        end: info.end,
+                    decision.lines_hint = if moved_from.is_some() && using_current_content_fallback
+                    {
+                        LineRange {
+                            start: info.start,
+                            end: info.end,
+                        }
+                    } else {
+                        shifted_range
                     };
                     true
                 } else {
-                    decision.lines_hint =
-                        apply_line_changes_to_range(&line_changes, decision.lines_hint.clone());
+                    decision.lines_hint = shifted_range;
                     false
                 };
 
@@ -1616,25 +1623,13 @@ mod tests {
             "2-4:fn:kept\n"
         );
 
-        assert_eq!(
-            post_tool_use(&root, &file).unwrap(),
-            "Re-anchored src/shift.ts: 0 stale, 0 orphan."
-        );
-        let stored = load_dlog(&root, &file).unwrap().unwrap();
-        let decision = stored.decisions.get_str("fn:kept").unwrap();
-        assert_eq!(decision.lines_hint, LineRange { start: 2, end: 4 });
-        assert_eq!(decision.status, None);
-        assert_eq!(
-            fs::read_to_string(dmap_path(&root, &file)).unwrap(),
-            "2-4:fn:kept\n"
-        );
         assert!(!decision_lock_path(&root, &file).exists());
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn post_tool_use_shifts_lines_from_current_anchor_without_git() {
+    fn post_tool_use_keeps_stored_range_without_git_baseline() {
         let root = unique_temp_dir("archiva-project-post-shift-no-git");
         let source_path = root.join("src").join("shift.ts");
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -1657,22 +1652,22 @@ mod tests {
 
         assert_eq!(
             post_tool_use(&root, &file).unwrap(),
-            "Re-anchored src/shift.ts: 0 stale, 0 orphan."
+            "Re-anchored src/shift.ts: 1 stale, 0 orphan."
         );
         let stored = load_dlog(&root, &file).unwrap().unwrap();
         let decision = stored.decisions.get_str("fn:kept").unwrap();
-        assert_eq!(decision.lines_hint, LineRange { start: 2, end: 4 });
-        assert_eq!(decision.status, None);
+        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 3 });
+        assert_eq!(decision.status, Some(DecisionStatus::Stale));
         assert_eq!(
             fs::read_to_string(dmap_path(&root, &file)).unwrap(),
-            "2-4:fn:kept\n"
+            "1-3:fn:kept:STALE\n"
         );
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn post_tool_use_updates_anchor_end_from_current_range() {
+    fn post_tool_use_preserves_stored_range_when_anchor_body_grows() {
         let root = unique_temp_dir("archiva-project-post-range-growth");
         let source_path = root.join("src").join("growth.ts");
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -1699,11 +1694,11 @@ mod tests {
         );
         let stored = load_dlog(&root, &file).unwrap().unwrap();
         let decision = stored.decisions.get_str("fn:kept").unwrap();
-        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 4 });
+        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 3 });
         assert_eq!(decision.status, Some(DecisionStatus::Stale));
         assert_eq!(
             fs::read_to_string(dmap_path(&root, &file)).unwrap(),
-            "1-4:fn:kept:STALE\n"
+            "1-3:fn:kept:STALE\n"
         );
 
         let _ = fs::remove_dir_all(root);

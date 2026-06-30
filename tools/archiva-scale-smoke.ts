@@ -97,6 +97,11 @@ type CorpusDecision = {
   lines: [number, number];
 };
 
+type CorpusAnchorCandidate = {
+  anchor: string;
+  lines: [number, number];
+};
+
 type CorpusLanguage = "typescript" | "rust" | "c/cpp";
 
 type CorpusSelection = {
@@ -182,7 +187,7 @@ if (corpusRequested) {
     throw new Error("ARCHIVA_SCALE_CORPUS_ROOT is required when ARCHIVA_SCALE_CORPUS=1");
   }
   const corpusRoot = path.resolve(repoRoot, corpusRootInput);
-  const selection = await selectCorpus(corpusRoot, corpusConfig);
+  const selection = await selectCorpus(corpusRoot, corpusConfig, rustRuntime);
   const rustCorpus = await runCorpusScale(rustRuntime, selection.corpusRoot, selection.selected, corpusConfig, true);
   if (selection.language === "rust") {
     assertRustCorpusCoverage(selection, rustCorpus.semanticSummary);
@@ -235,7 +240,7 @@ console.log(
     2
   )
 );
-process.exit(parityOk && corpusOk ? 0 : 1);
+process.exitCode = parityOk && corpusOk ? 0 : 1;
 
 async function runScale(
   runtime: Runtime,
@@ -1185,7 +1190,11 @@ function tail(value: string): string {
   return JSON.stringify(normalized.length > 2000 ? normalized.slice(-2000) : normalized);
 }
 
-async function selectCorpus(corpusRoot: string, config: ScaleConfig): Promise<CorpusSelection> {
+async function selectCorpus(
+  corpusRoot: string,
+  config: ScaleConfig,
+  validatorRuntime: Runtime
+): Promise<CorpusSelection> {
   const rootStat = await fs.stat(corpusRoot).catch((error) => {
     throw new Error(`ARCHIVA_SCALE_CORPUS_ROOT is not readable: ${String(error)}`);
   });
@@ -1194,6 +1203,7 @@ async function selectCorpus(corpusRoot: string, config: ScaleConfig): Promise<Co
   }
   const files = await listCorpusFiles(corpusRoot);
   const language = selectCorpusLanguage(files);
+  const validatorRoot = await tempProject(validatorRuntime.name, "corpus-anchor-select");
   const selected: CorpusDecision[] = [];
   let scannedFiles = 0;
   for (const file of files) {
@@ -1213,7 +1223,13 @@ async function selectCorpus(corpusRoot: string, config: ScaleConfig): Promise<Co
     if (content === undefined || content.includes("\0")) {
       continue;
     }
-    const anchor = findCorpusAnchor(file, content, language);
+    const anchor = await firstAcceptedCorpusAnchor(
+      validatorRuntime,
+      validatorRoot,
+      corpusRoot,
+      file,
+      findCorpusAnchors(file, content, language)
+    );
     if (anchor) {
       selected.push({ file, anchor: anchor.anchor, lines: anchor.lines });
     }
@@ -1225,6 +1241,39 @@ async function selectCorpus(corpusRoot: string, config: ScaleConfig): Promise<Co
     );
   }
   return { corpusRoot, language, scannedFiles, selected };
+}
+
+async function firstAcceptedCorpusAnchor(
+  runtime: Runtime,
+  validationRoot: string,
+  corpusRoot: string,
+  file: string,
+  candidates: CorpusAnchorCandidate[]
+): Promise<CorpusAnchorCandidate | undefined> {
+  if (candidates.length === 0) {
+    return undefined;
+  }
+  const absoluteTarget = path.join(validationRoot, file);
+  await fs.mkdir(path.dirname(absoluteTarget), { recursive: true });
+  await fs.copyFile(path.join(corpusRoot, file), absoluteTarget);
+  for (const candidate of candidates) {
+    const result = spawnSync(
+      runtime.command,
+      [...runtime.prefixArgs, "write-decision", "--json", JSON.stringify(corpusDecisionInput({ file, ...candidate }, 0))],
+      {
+        cwd: validationRoot,
+        encoding: "utf8",
+        maxBuffer: commandMaxBuffer,
+        timeout: commandTimeoutMs,
+        killSignal: "SIGKILL",
+        env: { ...process.env, ARCHIVA_SESSION: "scale_smoke_session" }
+      }
+    );
+    if (result.status === 0) {
+      return candidate;
+    }
+  }
+  return undefined;
 }
 
 async function summarizeArtifacts(root: string): Promise<ArtifactSummary> {
@@ -1451,25 +1500,26 @@ async function listCorpusFiles(root: string): Promise<string[]> {
   return output;
 }
 
-function findCorpusAnchor(
+function findCorpusAnchors(
   file: string,
   content: string,
   language = sourceLanguage(file)
-): { anchor: string; lines: [number, number] } | undefined {
+): CorpusAnchorCandidate[] {
   if (language === "rust") {
-    return findRustCorpusAnchor(file, content);
+    return findRustCorpusAnchors(file, content);
   }
   if (language === "c/cpp") {
-    return findCxxCorpusAnchor(file, content);
+    return findCxxCorpusAnchors(file, content);
   }
   if (language !== "typescript") {
-    return undefined;
+    return [];
   }
-  return findTypeScriptCorpusAnchor(content);
+  return findTypeScriptCorpusAnchors(content);
 }
 
-function findTypeScriptCorpusAnchor(content: string): { anchor: string; lines: [number, number] } | undefined {
+function findTypeScriptCorpusAnchors(content: string): CorpusAnchorCandidate[] {
   const lines = content.split(/\r?\n/);
+  const candidates: CorpusAnchorCandidate[] = [];
   let depth = 0;
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -1478,28 +1528,28 @@ function findTypeScriptCorpusAnchor(content: string): { anchor: string; lines: [
         /^\s*export\s+(?:declare\s+)?(?:(?:const\s+)?enum|namespace|module|interface|type|(?:abstract\s+)?class|(?:async\s+)?function|const|let|var)\s+([A-Za-z_$][\w$]*)\b/
       );
       if (exported) {
-        return { anchor: `export:${exported[1]}`, lines: [index + 1, index + 1] };
+        candidates.push({ anchor: `export:${exported[1]}`, lines: [index + 1, index + 1] });
       }
       const fn = line.match(/^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*(?:<[^(){};=]*)?\(/);
       if (fn) {
-        return { anchor: `fn:${fn[1]}`, lines: [index + 1, index + 1] };
+        candidates.push({ anchor: `fn:${fn[1]}`, lines: [index + 1, index + 1] });
       }
       const cls = line.match(/^\s*(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)\b/);
       if (cls) {
-        return { anchor: `class:${cls[1]}`, lines: [index + 1, index + 1] };
+        candidates.push({ anchor: `class:${cls[1]}`, lines: [index + 1, index + 1] });
       }
     }
     depth = updateBraceDepth(depth, line);
   }
-  return undefined;
+  return uniqueCorpusCandidates(candidates);
 }
 
-function findRustCorpusAnchor(file: string, content: string): { anchor: string; lines: [number, number] } | undefined {
+function findRustCorpusAnchors(file: string, content: string): CorpusAnchorCandidate[] {
   const lines = content.split(/\r?\n/);
-  const methodCandidates: { anchor: string; lines: [number, number] }[] = [];
-  const structuralCandidates: { anchor: string; lines: [number, number] }[] = [];
-  const functionCandidates: { anchor: string; lines: [number, number] }[] = [];
-  const implCandidates: { anchor: string; lines: [number, number] }[] = [];
+  const methodCandidates: CorpusAnchorCandidate[] = [];
+  const structuralCandidates: CorpusAnchorCandidate[] = [];
+  const functionCandidates: CorpusAnchorCandidate[] = [];
+  const implCandidates: CorpusAnchorCandidate[] = [];
   let depth = 0;
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -1525,18 +1575,14 @@ function findRustCorpusAnchor(file: string, content: string): { anchor: string; 
     }
     depth = updateBraceDepth(depth, line);
   }
-  const buckets = [methodCandidates, structuralCandidates, functionCandidates, implCandidates].filter(
-    (bucket) => bucket.length > 0
-  );
-  const bucket = buckets[stableBucket(file) % buckets.length];
-  return bucket?.[0];
+  return orderedCorpusCandidates(file, [methodCandidates, structuralCandidates, functionCandidates, implCandidates]);
 }
 
-function findCxxCorpusAnchor(file: string, content: string): { anchor: string; lines: [number, number] } | undefined {
+function findCxxCorpusAnchors(file: string, content: string): CorpusAnchorCandidate[] {
   const lines = content.split(/\r?\n/);
-  const methodCandidates: { anchor: string; lines: [number, number] }[] = [];
-  const structuralCandidates: { anchor: string; lines: [number, number] }[] = [];
-  const functionCandidates: { anchor: string; lines: [number, number] }[] = [];
+  const methodCandidates: CorpusAnchorCandidate[] = [];
+  const structuralCandidates: CorpusAnchorCandidate[] = [];
+  const functionCandidates: CorpusAnchorCandidate[] = [];
   const typeStack: { name: string; depth: number }[] = [];
   let depth = 0;
   for (let index = 0; index < lines.length; index += 1) {
@@ -1569,11 +1615,34 @@ function findCxxCorpusAnchor(file: string, content: string): { anchor: string; l
       typeStack.pop();
     }
   }
-  const buckets = [methodCandidates, structuralCandidates, functionCandidates].filter(
-    (bucket) => bucket.length > 0
-  );
-  const bucket = buckets[stableBucket(file) % buckets.length];
-  return bucket?.[0];
+  return orderedCorpusCandidates(file, [methodCandidates, structuralCandidates, functionCandidates]);
+}
+
+function orderedCorpusCandidates(file: string, buckets: CorpusAnchorCandidate[][]): CorpusAnchorCandidate[] {
+  const nonEmpty = buckets.filter((bucket) => bucket.length > 0);
+  if (nonEmpty.length === 0) {
+    return [];
+  }
+  const start = stableBucket(file) % nonEmpty.length;
+  const ordered: CorpusAnchorCandidate[] = [];
+  for (let offset = 0; offset < nonEmpty.length; offset += 1) {
+    ordered.push(...nonEmpty[(start + offset) % nonEmpty.length]);
+  }
+  return uniqueCorpusCandidates(ordered);
+}
+
+function uniqueCorpusCandidates(candidates: CorpusAnchorCandidate[]): CorpusAnchorCandidate[] {
+  const seen = new Set<string>();
+  const output: CorpusAnchorCandidate[] = [];
+  for (const candidate of candidates) {
+    const key = `${candidate.anchor}\0${candidate.lines[0]}\0${candidate.lines[1]}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(candidate);
+  }
+  return output;
 }
 
 function cxxDeclarationHeader(lines: string[], start: number): { text: string; endLine: number } | undefined {

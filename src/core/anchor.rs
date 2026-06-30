@@ -6475,8 +6475,42 @@ fn complexity_between(
                 {
                     complexity += 1;
                 }
+                text if text.starts_with('`') => {
+                    complexity += template_interpolation_complexity(text);
+                }
                 _ => {}
             }
+        }
+        index += 1;
+    }
+    complexity
+}
+
+fn template_interpolation_complexity(template: &str) -> u32 {
+    let bytes = template.as_bytes();
+    if bytes.first() != Some(&b'`') {
+        return 0;
+    }
+    let mut complexity = 0;
+    let mut index = 1;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[index] == b'$' && bytes[index + 1] == b'{' {
+            let expression_start = index + 2;
+            let Some(expression_end) = template_expression_end(template, expression_start) else {
+                break;
+            };
+            let expression_tokens = tokenize(&template[expression_start..expression_end]);
+            if !expression_tokens.is_empty() {
+                complexity +=
+                    complexity_between(&expression_tokens, 0, expression_tokens.len() - 1, None)
+                        - 1;
+            }
+            index = expression_end + 1;
+            continue;
         }
         index += 1;
     }
@@ -6491,9 +6525,40 @@ fn is_optional_type_marker(tokens: &[Token], index: usize) -> bool {
     if index == 0 {
         return false;
     }
+    match tokens.get(index + 1).map(|token| token.text.as_str()) {
+        Some(":") | Some(")") | Some(",") | Some(";") => true,
+        Some("(") => is_optional_method_question(tokens, index),
+        _ => false,
+    }
+}
+
+fn is_optional_method_question(tokens: &[Token], index: usize) -> bool {
+    let Some(previous) = index.checked_sub(1) else {
+        return false;
+    };
+    let member_start = if tokens[previous].text == "]" {
+        let brackets = matching_tokens(tokens, "[", "]");
+        brackets
+            .get(previous)
+            .and_then(|match_index| *match_index)
+            .unwrap_or(previous)
+    } else if previous > 0 && tokens[previous - 1].text == "#" {
+        previous - 1
+    } else {
+        previous
+    };
+    if member_start > 0 && tokens[member_start - 1].text == "." {
+        return false;
+    }
+    let Some(before_member) = member_start
+        .checked_sub(1)
+        .and_then(|cursor| tokens.get(cursor))
+    else {
+        return false;
+    };
     matches!(
-        tokens.get(index + 1).map(|token| token.text.as_str()),
-        Some(":") | Some("(") | Some(")") | Some(",") | Some(";")
+        before_member.text.as_str(),
+        "{" | "}" | ";" | "abstract" | "async" | "static" | "public" | "private" | "protected"
     )
 }
 
