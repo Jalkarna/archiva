@@ -136,5 +136,15 @@ jobs:
       - name: Native stress
         run: npm run stress:rust-port
 
+      - name: Reduced scale smoke
+        env:
+          ARCHIVA_SCALE_FILES: "32"
+          ARCHIVA_SCALE_DECISIONS: "12"
+          ARCHIVA_SCALE_MUTATE_FILES: "8"
+          ARCHIVA_SCALE_PARITY_FILES: "16"
+          ARCHIVA_SCALE_PARITY_DECISIONS: "8"
+          ARCHIVA_SCALE_PARITY_MUTATE_FILES: "6"
+        run: npm run scale:smoke
+
       - name: Package smoke test
         run: npm run smoke:package

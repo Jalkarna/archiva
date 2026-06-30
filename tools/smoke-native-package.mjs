@@ -128,6 +128,10 @@ function runInstalled(prefix, args, options = {}) {
   return `${result.stdout}${result.stderr}`.trim();
 }
 
+function git(cwd, args) {
+  run("git", args, { cwd });
+}
+
 function installNeedsForce(target) {
   return detectHostTarget()?.key !== target.key;
 }
@@ -344,6 +348,23 @@ async function assertInstalledCliBehavior(prefix, expectedVersion) {
     "export function makeThing() {\n  return 1;\n}\n",
     "utf8"
   );
+  await fs.writeFile(
+    path.join(project, "src", "lib.rs"),
+    "pub fn make_rust(input: i32) -> i32 {\n    if input > 0 {\n        input + 1\n    } else {\n        input\n    }\n}\n",
+    "utf8"
+  );
+  git(project, ["init", "--quiet"]);
+  git(project, ["add", "src"]);
+  git(project, [
+    "-c",
+    "user.name=Archiva Package Smoke",
+    "-c",
+    "user.email=archiva@example.invalid",
+    "commit",
+    "--quiet",
+    "-m",
+    "initial package smoke"
+  ]);
 
   const version = runInstalled(prefix, ["--version"]);
   if (!version.includes(expectedVersion)) {
@@ -363,13 +384,49 @@ async function assertInstalledCliBehavior(prefix, expectedVersion) {
   if (!write.includes("Recorded dec_001")) {
     throw new Error(`Installed write-decision returned '${write}'.`);
   }
+  const rustDecision = {
+    file: "src/lib.rs",
+    anchor: "fn:make_rust",
+    lines: [1, 7],
+    chose: "installed package rust smoke decision",
+    because: "package smoke must prove installed Rust source parsing",
+    rejected: [{ approach: "typescript-only smoke", reason: "does not exercise native Rust anchors" }]
+  };
+  const writeRust = runInstalled(prefix, ["write-decision"], { cwd: project, input: JSON.stringify(rustDecision) });
+  if (!writeRust.includes("Recorded dec_001")) {
+    throw new Error(`Installed Rust write-decision returned '${writeRust}'.`);
+  }
   const why = runInstalled(prefix, ["why", "src/a.ts", "fn:makeThing"], { cwd: project });
   if (!why.includes("installed package smoke decision")) {
     throw new Error(`Installed why did not return the recorded decision: '${why}'.`);
   }
+  const whyRust = runInstalled(prefix, ["why", "src/lib.rs", "fn:make_rust"], { cwd: project });
+  if (!whyRust.includes("installed package rust smoke decision")) {
+    throw new Error(`Installed Rust why did not return the recorded decision: '${whyRust}'.`);
+  }
+  const status = runInstalled(prefix, ["status"], { cwd: project });
+  if (!status.includes("Total: 2 decisions  0 stale  0 orphan  0 issues")) {
+    throw new Error(`Installed status did not report two clean decisions: '${status}'.`);
+  }
   const lint = runInstalled(prefix, ["lint"], { cwd: project });
   if (lint !== "No decision issues found.") {
     throw new Error(`Installed lint returned '${lint}'.`);
+  }
+  await fs.writeFile(
+    path.join(project, "src", "a.ts"),
+    "// inserted by package smoke\nexport function makeThing() {\n  return 1;\n}\n",
+    "utf8"
+  );
+  await fs.writeFile(
+    path.join(project, "src", "lib.rs"),
+    "// inserted by package smoke\npub fn make_rust(input: i32) -> i32 {\n    if input > 0 {\n        input + 1\n    } else {\n        input\n    }\n}\n",
+    "utf8"
+  );
+  runInstalled(prefix, ["hooks", "post-tool-use", "src/a.ts"], { cwd: project });
+  runInstalled(prefix, ["hooks", "post-tool-use", "src/lib.rs"], { cwd: project });
+  const shiftedLint = runInstalled(prefix, ["lint"], { cwd: project });
+  if (shiftedLint !== "No decision issues found.") {
+    throw new Error(`Installed post-tool-use did not preserve clean lint state: '${shiftedLint}'.`);
   }
 
   const mcpInput = [
@@ -384,6 +441,12 @@ async function assertInstalledCliBehavior(prefix, expectedVersion) {
       }
     }),
     JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "ghost_check", arguments: { file: "src/a.ts" } }
+    }),
     ""
   ].join("\n");
   const mcp = run(installedBin(prefix), ["mcp"], { cwd: project, capture: true, input: mcpInput });
@@ -399,6 +462,14 @@ async function assertInstalledCliBehavior(prefix, expectedVersion) {
     if (!toolNames.has(expected)) {
       throw new Error(`Installed MCP tools/list missing ${expected}: ${mcp.stdout}`);
     }
+  }
+  const ghostCheck = responses.find((response) => response.id === 3);
+  const ghostCheckText = JSON.stringify(ghostCheck?.result ?? {});
+  if (
+    !ghostCheckText.includes("No issues found for src/a.ts.") &&
+    (!ghostCheckText.includes("0 stale") || !ghostCheckText.includes("0 orphan"))
+  ) {
+    throw new Error(`Installed MCP ghost_check did not report a clean file: ${mcp.stdout}`);
   }
 }
 

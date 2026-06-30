@@ -352,8 +352,8 @@ jobs:
   archiva:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: "20"
       - run: npx @jalkarna/archiva lint
@@ -378,6 +378,11 @@ before publishing native packages, publishes the meta package only after those
 native packages are available, and smoke tests the published install across the
 supported glibc, musl, macOS, and Windows targets.
 
+Architecture and validation records:
+
+- [Archiva v2 Rust Architecture](docs/archiva-v2-architecture.md)
+- [Archiva v2 Review Status](docs/archiva-v2-review-status.md)
+
 ### Heavy validation
 
 These commands are intended for release or port-validation work rather than the
@@ -385,10 +390,11 @@ fast inner loop:
 
 ```sh
 npm run differential:release
-npm run stress:rust-port
+npm run stress:soak
 npm run benchmark:compare
 npm run scale:smoke
 ARCHIVA_SCALE_CORPUS_ROOT=/path/to/repo npm run scale:corpus
+npm run audit:v2
 ```
 
 `scale:smoke` generates synthetic projects for a larger Rust-only profile and
@@ -415,21 +421,30 @@ The release workflow uses bounded defaults so publishing remains practical.
 Large seeded profiles and ignored soak tests are manual release evidence when
 raising confidence beyond the normal publish gate.
 
+`audit:v2` checks that the local repository still exposes the required Rust
+crate, zero-runtime-dependency package surface, exact validation script wiring,
+CLI/MCP behavior surface, long-horizon evidence producers, and explicit
+external evidence gaps. With `--evidence-dir <dir>`, it also validates collected
+heavy-validation and long-horizon JSON artifacts; this can point directly at a
+directory produced by `gh run download --dir <dir>`. It is an honesty gate: it
+passes when local evidence is internally consistent and still refuses to claim
+completion until CI, long-horizon, publish, and post-publish artifacts exist.
+
 `scale:corpus` copies a bounded subset of real source files into temporary
 projects, writes decisions, mutates files, runs hooks, lint, status,
 session-start, and why, then validates the resulting `.dlog` and `.dmap`
 artifacts. TypeScript/JavaScript corpora compare the TypeScript baseline
-against Rust. Rust corpora run the native Rust binary only, because the
-TypeScript baseline cannot parse Rust source. Tune it with
+against Rust. Rust and C/C++ corpora run the native Rust binary only, because
+the TypeScript baseline cannot parse those source languages. Tune it with
 `ARCHIVA_SCALE_CORPUS_FILES`, `ARCHIVA_SCALE_CORPUS_DECISIONS`,
 `ARCHIVA_SCALE_CORPUS_MUTATE_FILES`, and `ARCHIVA_SCALE_CORPUS_LANGUAGE`
-(`auto`, `typescript`, or `rust`).
+(`auto`, `typescript`, `rust`, or `c/cpp`).
 
 ## Current scope
 
 Supports today:
 
-- TypeScript, JavaScript, and Rust anchor extraction
+- TypeScript, JavaScript, Rust, and C/C++ anchor extraction
 - YAML `.dlog` files and compact `.dmap` files
 - local re-anchoring
 - linting

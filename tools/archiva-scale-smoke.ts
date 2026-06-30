@@ -46,7 +46,7 @@ type ScaleRunResult = {
   phases: PhaseResult[];
   commandSummaries: Record<string, CommandSummary>;
   artifactSummary: ArtifactSummary;
-  semanticSummary?: SeededSemanticSummary;
+  semanticSummary?: SeededSemanticSummary | CorpusSemanticSummary;
   parityArtifacts?: Record<string, string>;
 };
 
@@ -76,13 +76,28 @@ type SeededSemanticSummary = {
   tempArtifacts: number;
 };
 
+type CorpusSemanticSummary = {
+  kind: "corpus";
+  decisionFiles: number;
+  mutatedFiles: number;
+  dlogFiles: number;
+  dmapFiles: number;
+  shiftedDmapEntries: number;
+  stableDmapEntries: number;
+  staleDmapEntries: number;
+  anchorKinds: Record<string, number>;
+  statusMentionsTotal: true;
+  sessionMentionsFirstFile: true;
+  whyMentionsFirstDecision: true;
+};
+
 type CorpusDecision = {
   file: string;
   anchor: string;
   lines: [number, number];
 };
 
-type CorpusLanguage = "typescript" | "rust";
+type CorpusLanguage = "typescript" | "rust" | "c/cpp";
 
 type CorpusSelection = {
   corpusRoot: string;
@@ -145,14 +160,13 @@ const typescriptRuntime: Runtime = {
 const rustFull = await runScale(rustRuntime, fullConfig, false);
 const typescriptParity = await runScale(typescriptRuntime, parityConfig, true);
 const rustParity = await runScale(rustRuntime, parityConfig, true);
-const parityOk =
-  JSON.stringify(typescriptParity.parityArtifacts) === JSON.stringify(rustParity.parityArtifacts);
+const parityOk = scaleParityMatches(typescriptParity, rustParity);
 let corpusOk = true;
 let corpus:
   | {
       corpusRoot: string;
       language: CorpusLanguage;
-      validation: "typescript-rust-parity" | "rust-only";
+      validation: "typescript-rust-parity" | "rust-native-only" | "c/cpp-native-only";
       scannedFiles: number;
       selectedFiles: number;
       decisionWrites: number;
@@ -170,17 +184,20 @@ if (corpusRequested) {
   const corpusRoot = path.resolve(repoRoot, corpusRootInput);
   const selection = await selectCorpus(corpusRoot, corpusConfig);
   const rustCorpus = await runCorpusScale(rustRuntime, selection.corpusRoot, selection.selected, corpusConfig, true);
+  if (selection.language === "rust") {
+    assertRustCorpusCoverage(selection, rustCorpus.semanticSummary);
+  } else if (selection.language === "c/cpp") {
+    assertCxxCorpusCoverage(selection, rustCorpus.semanticSummary);
+  }
   const typescriptCorpus =
     selection.language === "typescript"
       ? await runCorpusScale(typescriptRuntime, selection.corpusRoot, selection.selected, corpusConfig, true)
       : undefined;
-  corpusOk =
-    typescriptCorpus === undefined ||
-    JSON.stringify(typescriptCorpus.parityArtifacts) === JSON.stringify(rustCorpus.parityArtifacts);
+  corpusOk = typescriptCorpus === undefined || scaleParityMatches(typescriptCorpus, rustCorpus);
   corpus = {
     corpusRoot: selection.corpusRoot,
     language: selection.language,
-    validation: selection.language === "typescript" ? "typescript-rust-parity" : "rust-only",
+    validation: selection.language === "typescript" ? "typescript-rust-parity" : `${selection.language}-native-only`,
     scannedFiles: selection.scannedFiles,
     selectedFiles: selection.selected.length,
     decisionWrites: corpusConfig.decisions,
@@ -396,6 +413,7 @@ async function runCorpusScale(
   const phases: PhaseResult[] = [];
   const phaseRss = new Map<string, PeakRss>();
   const commandSummaries: Record<string, CommandSummary> = {};
+  const commandOutputs: Partial<Record<"status" | "sessionStart" | "why", string>> = {};
   const decisionFiles = corpusFiles.slice(0, config.decisions);
   const mutatedFiles = decisionFiles.slice(0, config.mutateFiles);
   const runCommand = (phase: string, args: string[], input: string, expectedStatuses: number[]): CommandResult => {
@@ -456,15 +474,22 @@ async function runCorpusScale(
     commandSummaries.lint = summarize(runCommand("lint", ["lint"], "", [0, 1]));
   }, phaseRss);
   await measure(phases, "status", async () => {
-    commandSummaries.status = summarize(runCommand("status", ["status"], "", [0]));
+    const result = runCommand("status", ["status"], "", [0]);
+    commandOutputs.status = result.stdout;
+    commandSummaries.status = summarize(result);
   }, phaseRss);
   await measure(phases, "session-start", async () => {
-    commandSummaries.sessionStart = summarize(runCommand("session-start", ["hooks", "session-start"], "", [0]));
+    const result = runCommand("session-start", ["hooks", "session-start"], "", [0]);
+    commandOutputs.sessionStart = result.stdout;
+    commandSummaries.sessionStart = summarize(result);
   }, phaseRss);
   await measure(phases, "why", async () => {
     const first = decisionFiles[0];
-    commandSummaries.why = summarize(runCommand("why", ["why", first.file, first.anchor], "", [0]));
+    const result = runCommand("why", ["why", first.file, first.anchor], "", [0]);
+    commandOutputs.why = result.stdout;
+    commandSummaries.why = summarize(result);
   }, phaseRss);
+  const semanticSummary = await verifyCorpusScaleArtifacts(root, decisionFiles, mutatedFiles, commandOutputs);
 
   return {
     root,
@@ -472,8 +497,180 @@ async function runCorpusScale(
     phases,
     commandSummaries,
     artifactSummary: await summarizeArtifacts(root),
+    semanticSummary,
     parityArtifacts: includeParityArtifacts ? await readDecisionArtifacts(root, decisionFiles) : undefined
   };
+}
+
+async function verifyCorpusScaleArtifacts(
+  root: string,
+  decisionFiles: CorpusDecision[],
+  mutatedFiles: CorpusDecision[],
+  commandOutputs: Partial<Record<"status" | "sessionStart" | "why", string>>
+): Promise<CorpusSemanticSummary> {
+  if (decisionFiles.length === 0) {
+    throw new Error("Corpus verification received no decision files");
+  }
+  const mutated = new Set(mutatedFiles.map((entry) => entry.file));
+  const anchorKinds: Record<string, number> = {};
+  let dlogFiles = 0;
+  let dmapFiles = 0;
+  let shiftedDmapEntries = 0;
+  let stableDmapEntries = 0;
+  let staleDmapEntries = 0;
+
+  for (let index = 0; index < decisionFiles.length; index += 1) {
+    const entry = decisionFiles[index];
+    const wasMutated = mutated.has(entry.file);
+    const dlogPath = path.join(root, `.decisions/${entry.file}.dlog`);
+    const dmapPath = path.join(root, `.decisions/${entry.file}.dmap`);
+    const dlog = await fs.readFile(dlogPath, "utf8");
+    const dmap = await fs.readFile(dmapPath, "utf8");
+    const dmapEntry = parseCorpusDmapEntry(dmap.trimEnd(), entry);
+    const block = corpusDecisionBlock(dlog, entry.anchor);
+    const anchorKind = corpusAnchorKind(entry.anchor);
+
+    dlogFiles += 1;
+    dmapFiles += 1;
+    anchorKinds[anchorKind] = (anchorKinds[anchorKind] ?? 0) + 1;
+    if (dmapEntry.start > entry.lines[0]) {
+      shiftedDmapEntries += 1;
+    } else {
+      stableDmapEntries += 1;
+    }
+    if (dmapEntry.stale) {
+      staleDmapEntries += 1;
+    }
+
+    if (wasMutated && dmapEntry.start <= entry.lines[0] && !dmapEntry.stale) {
+      throw new Error(
+        `Corpus verification expected ${entry.file} ${entry.anchor} to shift or become stale after mutation; got ${dmap.trimEnd()}`
+      );
+    }
+    if (!wasMutated && dmapEntry.start !== entry.lines[0]) {
+      throw new Error(
+        `Corpus verification expected ${entry.file} ${entry.anchor} to stay at line ${entry.lines[0]}; got ${dmap.trimEnd()}`
+      );
+    }
+    assertIncludes(block, `    chose: corpus decision ${index}`, `${entry.file} ${entry.anchor} chose`);
+    assertIncludes(block, "    because:", `${entry.file} ${entry.anchor} because`);
+    assertIncludes(
+      block,
+      `    lines_hint:\n      - ${dmapEntry.start}\n      - ${dmapEntry.end}\n`,
+      `${entry.file} ${entry.anchor} line hint`
+    );
+  }
+
+  const first = decisionFiles[0];
+  assertIncludes(commandOutputs.why ?? "", first.anchor, "corpus why output anchor");
+  assertIncludes(commandOutputs.why ?? "", "corpus decision 0", "corpus why output decision text");
+  assertIncludes(commandOutputs.status ?? "", `Total: ${decisionFiles.length} decisions`, "corpus status total");
+  assertIncludes(commandOutputs.sessionStart ?? "", first.file, "corpus session-start first file");
+  if (mutatedFiles.length > 0 && shiftedDmapEntries + staleDmapEntries === 0) {
+    throw new Error("Corpus verification found no shifted or stale dmap entries after mutation");
+  }
+
+  return {
+    kind: "corpus",
+    decisionFiles: decisionFiles.length,
+    mutatedFiles: mutatedFiles.length,
+    dlogFiles,
+    dmapFiles,
+    shiftedDmapEntries,
+    stableDmapEntries,
+    staleDmapEntries,
+    anchorKinds: sortedRecord(anchorKinds),
+    statusMentionsTotal: true,
+    sessionMentionsFirstFile: true,
+    whyMentionsFirstDecision: true
+  };
+}
+
+function parseCorpusDmapEntry(
+  dmapEntry: string,
+  decision: CorpusDecision
+): { start: number; end: number; stale: boolean } {
+  const stale = dmapEntry.endsWith(":STALE");
+  const base = stale ? dmapEntry.slice(0, -":STALE".length) : dmapEntry;
+  const anchorSuffix = `:${decision.anchor}`;
+  if (!base.endsWith(anchorSuffix)) {
+    throw new Error(`Corpus verification expected ${decision.anchor} in dmap, got ${JSON.stringify(dmapEntry)}`);
+  }
+  const range = base.slice(0, -anchorSuffix.length);
+  const [startText, endText, extra] = range.split("-");
+  const start = Number(startText);
+  const end = Number(endText);
+  if (extra !== undefined || !Number.isInteger(start) || !Number.isInteger(end) || start <= 0 || end < start) {
+    throw new Error(`Corpus verification found malformed dmap range ${JSON.stringify(dmapEntry)}`);
+  }
+  return { start, end, stale };
+}
+
+function corpusDecisionBlock(dlog: string, anchor: string): string {
+  const marker = `  ${anchor}:\n`;
+  const start = dlog.indexOf(marker);
+  if (start === -1) {
+    throw new Error(`Corpus verification could not find ${anchor} in dlog`);
+  }
+  const afterMarker = start + marker.length;
+  const next = dlog.slice(afterMarker).search(/\n  [^ \n][^\n]*:\n/);
+  return dlog.slice(start, next === -1 ? dlog.length : afterMarker + next + 1);
+}
+
+function corpusAnchorKind(anchor: string): string {
+  if (anchor.startsWith("fn:")) {
+    return anchor.slice("fn:".length).includes(".") ? "method" : "function";
+  }
+  const separator = anchor.indexOf(":");
+  return separator === -1 ? "unknown" : anchor.slice(0, separator);
+}
+
+function assertRustCorpusCoverage(
+  selection: CorpusSelection,
+  semanticSummary: ScaleRunResult["semanticSummary"]
+): void {
+  if (!semanticSummary || !("kind" in semanticSummary) || semanticSummary.kind !== "corpus") {
+    throw new Error("Rust corpus validation did not produce a corpus semantic summary");
+  }
+  const coveredKinds = Object.keys(semanticSummary.anchorKinds).filter(
+    (kind) => semanticSummary.anchorKinds[kind] > 0
+  );
+  if (selection.selected.length >= 12 && coveredKinds.length < 2) {
+    throw new Error(
+      `Rust corpus validation covered only ${coveredKinds.join(", ") || "no"} anchor kind; expected at least two kinds`
+    );
+  }
+  const structuralKinds = ["enum", "impl", "method", "mod", "struct", "trait"];
+  if (
+    selection.selected.length >= 24 &&
+    !structuralKinds.some((kind) => (semanticSummary.anchorKinds[kind] ?? 0) > 0)
+  ) {
+    throw new Error("Rust corpus validation selected no structural, impl, or method anchors");
+  }
+}
+
+function assertCxxCorpusCoverage(
+  selection: CorpusSelection,
+  semanticSummary: ScaleRunResult["semanticSummary"]
+): void {
+  if (!semanticSummary || !("kind" in semanticSummary) || semanticSummary.kind !== "corpus") {
+    throw new Error("C/C++ corpus validation did not produce a corpus semantic summary");
+  }
+  const coveredKinds = Object.keys(semanticSummary.anchorKinds).filter(
+    (kind) => semanticSummary.anchorKinds[kind] > 0
+  );
+  if (selection.selected.length >= 12 && coveredKinds.length < 2) {
+    throw new Error(
+      `C/C++ corpus validation covered only ${coveredKinds.join(", ") || "no"} anchor kind; expected at least two kinds`
+    );
+  }
+  const structuralKinds = ["class", "enum", "method", "struct"];
+  if (
+    selection.selected.length >= 24 &&
+    !structuralKinds.some((kind) => (semanticSummary.anchorKinds[kind] ?? 0) > 0)
+  ) {
+    throw new Error("C/C++ corpus validation selected no class, struct, enum, or method anchors");
+  }
 }
 
 async function measure(
@@ -501,6 +698,23 @@ function compactRun(result: ScaleRunResult): Omit<ScaleRunResult, "parityArtifac
     artifactSummary: result.artifactSummary,
     semanticSummary: result.semanticSummary
   };
+}
+
+function scaleParityMatches(left: ScaleRunResult, right: ScaleRunResult): boolean {
+  return (
+    JSON.stringify(left.parityArtifacts) === JSON.stringify(right.parityArtifacts) &&
+    JSON.stringify(comparableCommandSummaries(left.commandSummaries)) ===
+      JSON.stringify(comparableCommandSummaries(right.commandSummaries))
+  );
+}
+
+function comparableCommandSummaries(commandSummaries: Record<string, CommandSummary>): Record<string, Omit<CommandSummary, "peakRss">> {
+  const output: Record<string, Omit<CommandSummary, "peakRss">> = {};
+  for (const key of Object.keys(commandSummaries).sort()) {
+    const { peakRss: _peakRss, ...summary } = commandSummaries[key];
+    output[key] = summary;
+  }
+  return output;
 }
 
 function decisionInput(index: number, config: SyntheticScaleConfig): unknown {
@@ -773,22 +987,30 @@ function countDecisionTreeResidue(decisionRoot: string): { lockArtifacts: number
 
 function assertIncludes(value: string, expected: string, label: string): void {
   if (!value.includes(expected)) {
-    throw new Error(`Seeded verification failed for ${label}: missing ${JSON.stringify(expected)}`);
+    throw new Error(`Scale verification failed for ${label}: missing ${JSON.stringify(expected)}`);
   }
 }
 
 function assertNotIncludes(value: string, unexpected: string, label: string): void {
   if (value.includes(unexpected)) {
-    throw new Error(`Seeded verification failed for ${label}: unexpected ${JSON.stringify(unexpected)}`);
+    throw new Error(`Scale verification failed for ${label}: unexpected ${JSON.stringify(unexpected)}`);
   }
 }
 
 function assertEqual(actual: string, expected: string, label: string): void {
   if (actual !== expected) {
     throw new Error(
-      `Seeded verification failed for ${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`
+      `Scale verification failed for ${label}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`
     );
   }
+}
+
+function sortedRecord(record: Record<string, number>): Record<string, number> {
+  const output: Record<string, number> = {};
+  for (const key of Object.keys(record).sort()) {
+    output[key] = record[key];
+  }
+  return output;
 }
 
 function decisionId(index: number): string {
@@ -1167,10 +1389,10 @@ function corpusLanguageEnv(name: string): CorpusLanguage | "auto" {
   if (!value || value === "auto") {
     return "auto";
   }
-  if (value === "typescript" || value === "rust") {
+  if (value === "typescript" || value === "rust" || value === "c/cpp") {
     return value;
   }
-  throw new Error(`${name} must be auto, typescript, or rust`);
+  throw new Error(`${name} must be auto, typescript, rust, or c/cpp`);
 }
 
 async function listFiles(root: string): Promise<string[]> {
@@ -1236,6 +1458,9 @@ function findCorpusAnchor(
 ): { anchor: string; lines: [number, number] } | undefined {
   if (language === "rust") {
     return findRustCorpusAnchor(file, content);
+  }
+  if (language === "c/cpp") {
+    return findCxxCorpusAnchor(file, content);
   }
   if (language !== "typescript") {
     return undefined;
@@ -1305,6 +1530,83 @@ function findRustCorpusAnchor(file: string, content: string): { anchor: string; 
   );
   const bucket = buckets[stableBucket(file) % buckets.length];
   return bucket?.[0];
+}
+
+function findCxxCorpusAnchor(file: string, content: string): { anchor: string; lines: [number, number] } | undefined {
+  const lines = content.split(/\r?\n/);
+  const methodCandidates: { anchor: string; lines: [number, number] }[] = [];
+  const structuralCandidates: { anchor: string; lines: [number, number] }[] = [];
+  const functionCandidates: { anchor: string; lines: [number, number] }[] = [];
+  const typeStack: { name: string; depth: number }[] = [];
+  let depth = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = stripCxxLineComment(lines[index]);
+    const structural = line.match(/^\s*(?:template\s*<[^>{;]*>\s*)?(class|struct|enum)(?:\s+(?:class|struct))?\s+([A-Za-z_][A-Za-z0-9_]*)\b.*\{/);
+    if (structural) {
+      const anchor = `${structural[1]}:${structural[2]}`;
+      structuralCandidates.push({ anchor, lines: [index + 1, index + 1] });
+      if (structural[1] === "class" || structural[1] === "struct") {
+        typeStack.push({ name: structural[2], depth: depth + 1 });
+      }
+    }
+    const header = cxxDeclarationHeader(lines, index);
+    if (header) {
+      const qualified = header.text.match(/^\s*(?:template\s*<[^>{;]*>\s*)?(?:[A-Za-z_][\w:<>,~*&\s]*\s+)?([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_~][A-Za-z0-9_~]*)+)\s*\([^;]*\)\s*(?:const\s*)?(?:noexcept\s*)?(?:override\s*)?(?:final\s*)?\{/);
+      if (qualified) {
+        const anchor = `fn:${qualified[1].replace(/::/g, ".")}`;
+        methodCandidates.push({ anchor, lines: [index + 1, header.endLine] });
+      } else {
+        const fn = header.text.match(/^\s*(?:template\s*<[^>{;]*>\s*)?(?:(?:static|inline|extern|virtual|constexpr|consteval|constinit|friend|explicit)\s+)*(?:[A-Za-z_][\w:<>,~*&\s]*\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*(?:const\s*)?(?:noexcept\s*)?(?:override\s*)?(?:final\s*)?\{/);
+        if (fn && !cxxControlKeyword(fn[1])) {
+          const currentType = [...typeStack].reverse().find((scope) => scope.depth <= depth);
+          const anchor = currentType ? `fn:${currentType.name}.${fn[1]}` : `fn:${fn[1]}`;
+          (currentType ? methodCandidates : functionCandidates).push({ anchor, lines: [index + 1, header.endLine] });
+        }
+      }
+    }
+    depth = updateBraceDepth(depth, line);
+    while (typeStack.length > 0 && typeStack[typeStack.length - 1].depth > depth) {
+      typeStack.pop();
+    }
+  }
+  const buckets = [methodCandidates, structuralCandidates, functionCandidates].filter(
+    (bucket) => bucket.length > 0
+  );
+  const bucket = buckets[stableBucket(file) % buckets.length];
+  return bucket?.[0];
+}
+
+function cxxDeclarationHeader(lines: string[], start: number): { text: string; endLine: number } | undefined {
+  const first = stripCxxLineComment(lines[start]);
+  if (first.trimStart().startsWith("#")) {
+    return undefined;
+  }
+  let header = "";
+  for (let index = start; index < Math.min(lines.length, start + 8); index += 1) {
+    const line = stripCxxLineComment(lines[index]).trim();
+    if (line === "" || line.startsWith("#")) {
+      continue;
+    }
+    header = `${header} ${line}`.trim();
+    const blockIndex = header.indexOf("{");
+    const semicolonIndex = header.indexOf(";");
+    if (blockIndex !== -1 && (semicolonIndex === -1 || blockIndex < semicolonIndex)) {
+      return { text: header, endLine: index + 1 };
+    }
+    if (semicolonIndex !== -1) {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function stripCxxLineComment(line: string): string {
+  const comment = line.indexOf("//");
+  return comment === -1 ? line : line.slice(0, comment);
+}
+
+function cxxControlKeyword(value: string): boolean {
+  return ["if", "for", "while", "switch", "catch", "sizeof", "return"].includes(value);
 }
 
 function rustStructuralCorpusAnchor(line: string): string | undefined {
@@ -1524,6 +1826,20 @@ function sourceLanguage(file: string): CorpusLanguage | undefined {
   if (lower.endsWith(".rs")) {
     return "rust";
   }
+  if (
+    lower.endsWith(".c") ||
+    lower.endsWith(".h") ||
+    lower.endsWith(".cc") ||
+    lower.endsWith(".cpp") ||
+    lower.endsWith(".cxx") ||
+    lower.endsWith(".hh") ||
+    lower.endsWith(".hpp") ||
+    lower.endsWith(".hxx") ||
+    lower.endsWith(".ipp") ||
+    lower.endsWith(".inc")
+  ) {
+    return "c/cpp";
+  }
   return undefined;
 }
 
@@ -1533,13 +1849,19 @@ function selectCorpusLanguage(files: string[]): CorpusLanguage {
   }
   let typeScriptFiles = 0;
   let rustFiles = 0;
+  let cxxFiles = 0;
   for (const file of files) {
     const language = sourceLanguage(file);
     if (language === "typescript") {
       typeScriptFiles += 1;
     } else if (language === "rust") {
       rustFiles += 1;
+    } else if (language === "c/cpp") {
+      cxxFiles += 1;
     }
+  }
+  if (cxxFiles > rustFiles && cxxFiles > typeScriptFiles) {
+    return "c/cpp";
   }
   return rustFiles > typeScriptFiles ? "rust" : "typescript";
 }

@@ -242,6 +242,9 @@ pub fn extract_anchors(file: &RelativePath, source: &str) -> AnchorExtraction {
     if is_rust_file(file) {
         return extract_rust_anchors(source);
     }
+    if is_c_family_file(file) {
+        return extract_c_family_anchors(source);
+    }
 
     let tokenization = tokenize_with_diagnostics(source);
     let all_tokens = tokenization.tokens;
@@ -439,6 +442,292 @@ fn extract_rust_anchors(source: &str) -> AnchorExtraction {
         complete: diagnostics.is_empty(),
         diagnostics,
     }
+}
+
+#[derive(Clone, Debug)]
+struct CFamilyTypeScope {
+    name: String,
+    kind: AnchorKind,
+    open: usize,
+    close: usize,
+}
+
+fn extract_c_family_anchors(source: &str) -> AnchorExtraction {
+    let tokenization = tokenize_with_diagnostics(source);
+    let tokens = tokenization.tokens;
+    let mut diagnostics = tokenization.diagnostics;
+    let parens = matching_tokens(&tokens, "(", ")");
+    let braces = matching_tokens(&tokens, "{", "}");
+    let brackets = matching_tokens(&tokens, "[", "]");
+    collect_delimiter_diagnostics(source, &tokens, &parens, "(", ")", &mut diagnostics);
+    collect_delimiter_diagnostics(source, &tokens, &braces, "{", "}", &mut diagnostics);
+    collect_delimiter_diagnostics(source, &tokens, &brackets, "[", "]", &mut diagnostics);
+
+    let mut builder = AnchorBuilder::new();
+    let type_scopes = collect_c_family_type_anchors(&tokens, &braces, &mut builder);
+    collect_c_family_function_anchors(&tokens, &parens, &braces, &type_scopes, &mut builder);
+
+    let mut blocks = Vec::new();
+    collect_if_block_candidates(source, &tokens, &parens, &braces, 0, 0, &mut blocks);
+    collect_block_anchors(&mut builder, blocks);
+
+    AnchorExtraction {
+        anchors: builder.anchors,
+        complete: diagnostics.is_empty(),
+        diagnostics,
+    }
+}
+
+fn collect_c_family_type_anchors(
+    tokens: &[Token],
+    braces: &[Option<usize>],
+    builder: &mut AnchorBuilder,
+) -> Vec<CFamilyTypeScope> {
+    let mut scopes = Vec::new();
+    for index in 0..tokens.len() {
+        let (kind, mut name_index) = match tokens[index].text.as_str() {
+            "class" => (AnchorKind::Class, index + 1),
+            "struct" => (AnchorKind::Struct, index + 1),
+            "enum" => {
+                let next = tokens.get(index + 1).map(|token| token.text.as_str());
+                let name_index = if matches!(next, Some("class" | "struct")) {
+                    index + 2
+                } else {
+                    index + 1
+                };
+                (AnchorKind::Enum, name_index)
+            }
+            _ => continue,
+        };
+        if tokens
+            .get(index.checked_sub(1).unwrap_or(index))
+            .is_some_and(|token| token.text == ".")
+        {
+            continue;
+        }
+        let Some(open) = find_next_until(tokens, index + 1, "{", &[";", "=", ")", ","]) else {
+            continue;
+        };
+        let Some(close) = braces.get(open).and_then(|match_index| *match_index) else {
+            continue;
+        };
+        if !tokens
+            .get(name_index)
+            .is_some_and(|token| is_identifier(&token.text))
+        {
+            name_index = close + 1;
+        }
+        let Some(name_token) = tokens.get(name_index) else {
+            continue;
+        };
+        if !is_identifier(&name_token.text) || c_family_keyword(&name_token.text) {
+            continue;
+        }
+        let prefix = match kind {
+            AnchorKind::Class => "class",
+            AnchorKind::Struct => "struct",
+            AnchorKind::Enum => "enum",
+            _ => continue,
+        };
+        builder.add(
+            format!("{prefix}:{}", c_family_anchor_name(&name_token.text)),
+            tokens[index].line,
+            tokens[close].line,
+            1,
+            kind,
+        );
+        scopes.push(CFamilyTypeScope {
+            name: c_family_anchor_name(&name_token.text),
+            kind,
+            open,
+            close,
+        });
+    }
+    scopes
+}
+
+fn collect_c_family_function_anchors(
+    tokens: &[Token],
+    parens: &[Option<usize>],
+    braces: &[Option<usize>],
+    type_scopes: &[CFamilyTypeScope],
+    builder: &mut AnchorBuilder,
+) {
+    let mut function_ranges = Vec::<(usize, usize)>::new();
+    for body_open in 0..tokens.len() {
+        if tokens[body_open].text != "{" {
+            continue;
+        }
+        let Some(body_close) = braces.get(body_open).and_then(|match_index| *match_index) else {
+            continue;
+        };
+        if type_scopes.iter().any(|scope| scope.open == body_open) {
+            continue;
+        }
+        if function_ranges
+            .iter()
+            .any(|(open, close)| *open < body_open && body_open < *close)
+        {
+            continue;
+        }
+        let Some((name, name_index, kind)) =
+            c_family_function_anchor(tokens, parens, body_open, type_scopes)
+        else {
+            continue;
+        };
+        builder.add(
+            format!("fn:{name}"),
+            tokens[name_index].line,
+            tokens[body_close].line,
+            complexity_between(tokens, name_index, body_close, None),
+            kind,
+        );
+        function_ranges.push((body_open, body_close));
+    }
+}
+
+fn c_family_function_anchor(
+    tokens: &[Token],
+    parens: &[Option<usize>],
+    body_open: usize,
+    type_scopes: &[CFamilyTypeScope],
+) -> Option<(String, usize, AnchorKind)> {
+    let param_close = c_family_parameter_close_before_body(tokens, body_open)?;
+    let param_open = parens
+        .get(param_close)
+        .and_then(|match_index| *match_index)?;
+    let (mut name, name_index) = c_family_qualified_name_before(tokens, param_open)?;
+    if c_family_control_keyword(&tokens[name_index].text) {
+        return None;
+    }
+    let mut kind = if name.contains('.') {
+        AnchorKind::Method
+    } else {
+        AnchorKind::Function
+    };
+    if !name.contains('.') {
+        if let Some(scope) = type_scopes
+            .iter()
+            .filter(|scope| {
+                matches!(scope.kind, AnchorKind::Class | AnchorKind::Struct)
+                    && scope.open < body_open
+                    && body_open < scope.close
+            })
+            .min_by_key(|scope| scope.close - scope.open)
+        {
+            name = format!("{}.{}", scope.name, name);
+            kind = AnchorKind::Method;
+        }
+    }
+    Some((name, name_index, kind))
+}
+
+fn c_family_parameter_close_before_body(tokens: &[Token], body_open: usize) -> Option<usize> {
+    let mut index = body_open.checked_sub(1)?;
+    loop {
+        match tokens[index].text.as_str() {
+            ")" => return Some(index),
+            "const" | "volatile" | "noexcept" | "override" | "final" | "&" | "&&" => {}
+            _ => return None,
+        }
+        index = index.checked_sub(1)?;
+    }
+}
+
+fn c_family_qualified_name_before(
+    tokens: &[Token],
+    before_index: usize,
+) -> Option<(String, usize)> {
+    let mut name_index = before_index.checked_sub(1)?;
+    while tokens
+        .get(name_index)
+        .is_some_and(|token| matches!(token.text.as_str(), "*" | "&" | "&&"))
+    {
+        name_index = name_index.checked_sub(1)?;
+    }
+    let name_token = tokens.get(name_index)?;
+    if !is_identifier(&name_token.text) || c_family_keyword(&name_token.text) {
+        return None;
+    }
+    let mut parts = vec![c_family_anchor_name(&name_token.text)];
+    let mut start_index = name_index;
+    let mut cursor = name_index;
+    while cursor >= 3
+        && tokens[cursor - 1].text == ":"
+        && tokens[cursor - 2].text == ":"
+        && is_identifier(&tokens[cursor - 3].text)
+        && !c_family_keyword(&tokens[cursor - 3].text)
+    {
+        cursor -= 3;
+        start_index = cursor;
+        parts.push(c_family_anchor_name(&tokens[cursor].text));
+    }
+    parts.reverse();
+    Some((parts.join("."), start_index))
+}
+
+fn c_family_anchor_name(name: &str) -> String {
+    name.to_string()
+}
+
+fn c_family_control_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "if" | "for" | "while" | "switch" | "catch" | "sizeof" | "alignof" | "return"
+    )
+}
+
+fn c_family_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "auto"
+            | "bool"
+            | "break"
+            | "case"
+            | "catch"
+            | "char"
+            | "class"
+            | "const"
+            | "continue"
+            | "default"
+            | "delete"
+            | "do"
+            | "double"
+            | "else"
+            | "enum"
+            | "explicit"
+            | "extern"
+            | "float"
+            | "for"
+            | "friend"
+            | "goto"
+            | "if"
+            | "inline"
+            | "int"
+            | "long"
+            | "namespace"
+            | "new"
+            | "operator"
+            | "private"
+            | "protected"
+            | "public"
+            | "register"
+            | "return"
+            | "short"
+            | "signed"
+            | "sizeof"
+            | "static"
+            | "struct"
+            | "switch"
+            | "template"
+            | "typedef"
+            | "union"
+            | "unsigned"
+            | "virtual"
+            | "void"
+            | "volatile"
+            | "while"
+    )
 }
 
 fn collect_rust_item_anchors(
@@ -2721,6 +3010,14 @@ fn is_tsx_file(file: &RelativePath) -> bool {
 
 fn is_rust_file(file: &RelativePath) -> bool {
     file.as_str().ends_with(".rs")
+}
+
+fn is_c_family_file(file: &RelativePath) -> bool {
+    let lower = file.as_str().to_ascii_lowercase();
+    matches!(
+        lower.rsplit_once('.').map(|(_, extension)| extension),
+        Some("c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "ipp" | "inc")
+    )
 }
 
 fn tsx_ambiguous_generic_arrow_limit(tokens: &[Token]) -> Option<usize> {
@@ -11856,6 +12153,102 @@ function complex() {
             .unwrap();
         assert_eq!((block.start, block.end, block.complexity), (3, 5, 4));
         assert_eq!(block.kind.as_str(), "block");
+    }
+
+    #[test]
+    fn extracts_c_family_functions_types_methods_and_blocks() {
+        let extraction = extract_anchors(
+            &RelativePath::new("src/driver.c").unwrap(),
+            r#"typedef struct device {
+    int id;
+} device_t;
+
+static int probe(struct device *dev)
+{
+    if (dev && dev->id > 0 || fallback(dev)) {
+        return dev->id;
+    }
+    return 0;
+}
+
+enum state {
+    STATE_READY,
+};
+"#,
+        );
+
+        assert_eq!(
+            extraction
+                .anchors
+                .iter()
+                .map(|(anchor, _)| anchor.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "struct:device",
+                "enum:state",
+                "fn:probe",
+                "block:if_dev_dev_id_0_fallback_dev",
+            ]
+        );
+        assert_eq!(
+            (
+                extraction.anchors.get_str("struct:device").unwrap().start,
+                extraction.anchors.get_str("struct:device").unwrap().end,
+                extraction.anchors.get_str("fn:probe").unwrap().start,
+                extraction.anchors.get_str("fn:probe").unwrap().end,
+            ),
+            (1, 3, 5, 11)
+        );
+    }
+
+    #[test]
+    fn extracts_cpp_inline_and_qualified_methods() {
+        let extraction = extract_anchors(
+            &RelativePath::new("src/store.cpp").unwrap(),
+            r#"class Store {
+public:
+    int get() const {
+        if (ready_ && value_ > 0 || fallback()) {
+            return value_;
+        }
+        return 0;
+    }
+private:
+    bool ready_;
+    int value_;
+};
+
+int Store::set(int value)
+{
+    value_ = value;
+    return value_;
+}
+"#,
+        );
+
+        assert_eq!(
+            extraction
+                .anchors
+                .iter()
+                .map(|(anchor, _)| anchor.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "class:Store",
+                "fn:Store.get",
+                "fn:Store.set",
+                "block:if_ready__value__0_fallback",
+            ]
+        );
+        assert_eq!(
+            (
+                extraction.anchors.get_str("fn:Store.get").unwrap().start,
+                extraction.anchors.get_str("fn:Store.get").unwrap().end,
+                extraction.anchors.get_str("fn:Store.get").unwrap().kind,
+                extraction.anchors.get_str("fn:Store.set").unwrap().start,
+                extraction.anchors.get_str("fn:Store.set").unwrap().kind,
+            ),
+            (3, 8, AnchorKind::Method, 14, AnchorKind::Method)
+        );
     }
 
     #[test]

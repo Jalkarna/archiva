@@ -11,14 +11,14 @@ use crate::core::decision_status::{
     clear_recovered_status, is_fingerprint_stale, mark_orphan, mark_stale_now,
 };
 use crate::core::diff::{apply_line_changes_to_range, diff_lines};
-use crate::core::dlog::DlogFile;
+use crate::core::dlog::{DlogFile, LineRange};
 use crate::core::error::{ArchivaError, Result};
 use crate::core::fingerprint::{fingerprint, get_lines};
 use crate::core::fs::{
     list_files, list_storage_files, path_exists, read_text_file_with_limit, read_text_if_exists,
     read_text_if_exists_with_limit, SOURCE_FILE_MAX_BYTES,
 };
-use crate::core::git::{git_renamed_from, read_git_head_file};
+use crate::core::git::read_git_head_file;
 use crate::core::gitignore::GitignoreMatcher;
 use crate::core::lint::{LintIssue, LintRule, LintSeverity};
 use crate::core::paths::{
@@ -31,7 +31,10 @@ use crate::core::storage::{
 };
 use crate::core::time::now_utc_millis;
 
-const SOURCE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs", "rs"];
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "c", "h", "cc", "cpp", "cxx", "hh", "hpp", "hxx",
+    "ipp", "inc",
+];
 
 pub fn why(project_root: &Path, file: &RelativePath, anchor: Option<&str>) -> Result<String> {
     let dlog = load_dlog(project_root, file)?;
@@ -218,7 +221,6 @@ pub fn write_decision_with_context(
 }
 
 pub fn post_tool_use(project_root: &Path, file: &RelativePath) -> Result<String> {
-    let git_renamed_from = git_renamed_from(project_root, file).unwrap_or(None);
     let has_current_dlog = path_exists(&dlog_path(project_root, file))?;
     let mut new_content = None::<String>;
     let mut extraction = None::<AnchorExtraction>;
@@ -227,27 +229,9 @@ pub fn post_tool_use(project_root: &Path, file: &RelativePath) -> Result<String>
     } else {
         let lock_timestamp = now_utc_millis()
             .map_err(|source| ArchivaError::cli(format!("Failed to read system time: {source}")))?;
-        let git_source = if let Some(old_file) = git_renamed_from.as_ref() {
-            path_exists(&dlog_path(project_root, old_file))?.then_some(old_file)
-        } else {
-            None
-        };
-        if let Some(old_file) = git_source {
-            move_dlog_and_dmap_locked(
-                project_root,
-                old_file,
-                file,
-                "post-tool-use",
-                &lock_timestamp,
-            )?;
-            Some(old_file.clone())
-        } else {
-            let Some(content) = read_source_text_if_exists(project_root, file)? else {
-                return Ok(format!(
-                    "No decisions for {}; nothing to re-anchor.",
-                    file.as_str()
-                ));
-            };
+
+        let content = read_source_text_if_exists(project_root, file)?;
+        if let Some(content) = content {
             let anchors = extract_anchors(file, &content);
             let candidate = moved_dlog_candidate(project_root, file, &content, &anchors)?;
             new_content = Some(content);
@@ -264,6 +248,11 @@ pub fn post_tool_use(project_root: &Path, file: &RelativePath) -> Result<String>
             } else {
                 None
             }
+        } else {
+            return Ok(format!(
+                "No decisions for {}; nothing to re-anchor.",
+                file.as_str()
+            ));
         }
     };
 
@@ -279,10 +268,7 @@ pub fn post_tool_use(project_root: &Path, file: &RelativePath) -> Result<String>
         None => read_source_text(project_root, file)?,
     };
     let extraction = extraction.unwrap_or_else(|| extract_anchors(file, &new_content));
-    let old_git_file = git_renamed_from
-        .as_ref()
-        .or(moved_from.as_ref())
-        .unwrap_or(file);
+    let old_git_file = moved_from.as_ref().unwrap_or(file);
     let old_content =
         read_git_head_file(project_root, old_git_file).unwrap_or_else(|_| new_content.clone());
     let line_changes = diff_lines(&old_content, &new_content);
@@ -298,10 +284,19 @@ pub fn post_tool_use(project_root: &Path, file: &RelativePath) -> Result<String>
             let mut stale = 0_usize;
             let mut orphan = 0_usize;
             for (anchor, decision) in dlog.decisions.iter_mut() {
-                decision.lines_hint =
-                    apply_line_changes_to_range(&line_changes, decision.lines_hint.clone());
+                let anchor_exists = if let Some(info) = extraction.anchors.get_str(anchor) {
+                    decision.lines_hint = LineRange {
+                        start: info.start,
+                        end: info.end,
+                    };
+                    true
+                } else {
+                    decision.lines_hint =
+                        apply_line_changes_to_range(&line_changes, decision.lines_hint.clone());
+                    false
+                };
 
-                if extraction.anchors.get_str(anchor).is_none() {
+                if !anchor_exists {
                     if extraction.complete {
                         mark_orphan(decision);
                         orphan += 1;
@@ -1620,32 +1615,107 @@ mod tests {
             fs::read_to_string(dmap_path(&root, &file)).unwrap(),
             "2-4:fn:kept\n"
         );
+
+        assert_eq!(
+            post_tool_use(&root, &file).unwrap(),
+            "Re-anchored src/shift.ts: 0 stale, 0 orphan."
+        );
+        let stored = load_dlog(&root, &file).unwrap().unwrap();
+        let decision = stored.decisions.get_str("fn:kept").unwrap();
+        assert_eq!(decision.lines_hint, LineRange { start: 2, end: 4 });
+        assert_eq!(decision.status, None);
+        assert_eq!(
+            fs::read_to_string(dmap_path(&root, &file)).unwrap(),
+            "2-4:fn:kept\n"
+        );
         assert!(!decision_lock_path(&root, &file).exists());
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn post_tool_use_moves_decisions_after_git_file_rename() {
-        let root = unique_temp_dir("archiva-project-post-git-rename");
+    fn post_tool_use_shifts_lines_from_current_anchor_without_git() {
+        let root = unique_temp_dir("archiva-project-post-shift-no-git");
+        let source_path = root.join("src").join("shift.ts");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, "function kept() {\n  return 1;\n}\n").unwrap();
+        let input = write_input("src/shift.ts", "fn:kept", None);
+        write_decision_with_context(
+            &root,
+            &input,
+            "2026-06-26T20:31:18.340Z",
+            None,
+            "2026-06-26T20:31:18.341Z",
+        )
+        .unwrap();
+        fs::write(
+            &source_path,
+            "// inserted\nfunction kept() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        let file = RelativePath::new("src/shift.ts").unwrap();
+
+        assert_eq!(
+            post_tool_use(&root, &file).unwrap(),
+            "Re-anchored src/shift.ts: 0 stale, 0 orphan."
+        );
+        let stored = load_dlog(&root, &file).unwrap().unwrap();
+        let decision = stored.decisions.get_str("fn:kept").unwrap();
+        assert_eq!(decision.lines_hint, LineRange { start: 2, end: 4 });
+        assert_eq!(decision.status, None);
+        assert_eq!(
+            fs::read_to_string(dmap_path(&root, &file)).unwrap(),
+            "2-4:fn:kept\n"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_tool_use_updates_anchor_end_from_current_range() {
+        let root = unique_temp_dir("archiva-project-post-range-growth");
+        let source_path = root.join("src").join("growth.ts");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, "function kept() {\n  return 1;\n}\n").unwrap();
+        let input = write_input("src/growth.ts", "fn:kept", None);
+        write_decision_with_context(
+            &root,
+            &input,
+            "2026-06-26T20:31:18.340Z",
+            None,
+            "2026-06-26T20:31:18.341Z",
+        )
+        .unwrap();
+        fs::write(
+            &source_path,
+            "function kept() {\n  let value = 1;\n  return value;\n}\n",
+        )
+        .unwrap();
+        let file = RelativePath::new("src/growth.ts").unwrap();
+
+        assert_eq!(
+            post_tool_use(&root, &file).unwrap(),
+            "Re-anchored src/growth.ts: 1 stale, 0 orphan."
+        );
+        let stored = load_dlog(&root, &file).unwrap().unwrap();
+        let decision = stored.decisions.get_str("fn:kept").unwrap();
+        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 4 });
+        assert_eq!(decision.status, Some(DecisionStatus::Stale));
+        assert_eq!(
+            fs::read_to_string(dmap_path(&root, &file)).unwrap(),
+            "1-4:fn:kept:STALE\n"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_tool_use_moves_decisions_after_file_rename_with_local_evidence() {
+        let root = unique_temp_dir("archiva-project-post-local-rename");
         let old_source_path = root.join("src").join("old.ts");
         let new_source_path = root.join("src").join("new.ts");
         fs::create_dir_all(old_source_path.parent().unwrap()).unwrap();
         fs::write(&old_source_path, "function kept() {\n  return 1;\n}\n").unwrap();
-        git(&root, &["init"]);
-        git(&root, &["add", "src/old.ts"]);
-        git(
-            &root,
-            &[
-                "-c",
-                "user.name=Archiva Test",
-                "-c",
-                "user.email=archiva@example.invalid",
-                "commit",
-                "-m",
-                "initial",
-            ],
-        );
 
         let old_file = RelativePath::new("src/old.ts").unwrap();
         let new_file = RelativePath::new("src/new.ts").unwrap();
@@ -1658,7 +1728,7 @@ mod tests {
             "2026-06-26T20:31:18.341Z",
         )
         .unwrap();
-        git(&root, &["mv", "src/old.ts", "src/new.ts"]);
+        fs::rename(&old_source_path, &new_source_path).unwrap();
         fs::write(
             &new_source_path,
             "// inserted\nfunction kept() {\n  return 1;\n}\n",
@@ -1753,6 +1823,167 @@ mod tests {
                 .unwrap()
                 .status,
             Some(DecisionStatus::Orphan)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_tool_use_shifts_orphan_lines_from_git_head() {
+        let root = unique_temp_dir("archiva-project-post-orphan-shift");
+        let source_path = root.join("src").join("stress.ts");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        let old_source = concat!(
+            "export function task_0(input: number) {\n",
+            "  if (input > 0) {\n",
+            "    return input + 0;\n",
+            "  }\n",
+            "  return input - 0;\n",
+            "}\n",
+            "export function task_1(input: number) {\n",
+            "  if (input > 1) {\n",
+            "    return input + 1;\n",
+            "  }\n",
+            "  return input - 1;\n",
+            "}\n",
+            "export function task_2(input: number) {\n",
+            "  if (input > 2) {\n",
+            "    return input + 2;\n",
+            "  }\n",
+            "  return input - 2;\n",
+            "}\n",
+        );
+        fs::write(&source_path, old_source).unwrap();
+        git(&root, &["init"]);
+        git(&root, &["add", "src/stress.ts"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Archiva Test",
+                "-c",
+                "user.email=archiva@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+
+        let mut input = write_input("src/stress.ts", "fn:task_2", None);
+        input.lines = LineRange { start: 13, end: 18 };
+        write_decision_with_context(
+            &root,
+            &input,
+            "2026-06-26T20:31:18.340Z",
+            None,
+            "2026-06-26T20:31:18.341Z",
+        )
+        .unwrap();
+        let new_source = concat!(
+            "// deterministic stress mutation\n",
+            "export function task_0(input: number) {\n",
+            "  if (input > 0) {\n",
+            "    return input + 0;\n",
+            "  }\n",
+            "  return input - 0;\n",
+            "}\n",
+            "// inserted line before task_1\n",
+            "export function task_1(input: number) {\n",
+            "  if (input > 1) {\n",
+            "    return input + 1;\n",
+            "  }\n",
+            "  return input - 1;\n",
+            "}\n",
+        );
+        fs::write(&source_path, new_source).unwrap();
+
+        assert_eq!(
+            post_tool_use(&root, &input.file).unwrap(),
+            "Re-anchored src/stress.ts: 0 stale, 1 orphan."
+        );
+        let stored = load_dlog(&root, &input.file).unwrap().unwrap();
+        let decision = stored.decisions.get_str("fn:task_2").unwrap();
+        assert_eq!(decision.lines_hint, LineRange { start: 15, end: 20 });
+        assert_eq!(decision.status, Some(DecisionStatus::Orphan));
+        assert_eq!(
+            fs::read_to_string(dmap_path(&root, &input.file)).unwrap(),
+            "15-20:fn:task_2:ORPHAN\n"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn post_tool_use_shifts_orphan_lines_through_chained_symbolic_ref() {
+        let root = unique_temp_dir("archiva-project-post-orphan-symbolic-ref");
+        let source_path = root.join("src").join("stress.ts");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        let old_source = concat!(
+            "export function task_0(input: number) {\n",
+            "  return input + 0;\n",
+            "}\n",
+            "export function task_1(input: number) {\n",
+            "  return input + 1;\n",
+            "}\n",
+            "export function task_2(input: number) {\n",
+            "  return input + 2;\n",
+            "}\n",
+        );
+        fs::write(&source_path, old_source).unwrap();
+        git(&root, &["init"]);
+        git(&root, &["add", "src/stress.ts"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Archiva Test",
+                "-c",
+                "user.email=archiva@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        fs::write(
+            root.join(".git").join("refs").join("heads").join("chain"),
+            "ref: refs/heads/master\n",
+        )
+        .unwrap();
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/chain\n").unwrap();
+
+        let mut input = write_input("src/stress.ts", "fn:task_2", None);
+        input.lines = LineRange { start: 7, end: 9 };
+        write_decision_with_context(
+            &root,
+            &input,
+            "2026-06-26T20:31:18.340Z",
+            None,
+            "2026-06-26T20:31:18.341Z",
+        )
+        .unwrap();
+        let new_source = concat!(
+            "// deterministic stress mutation\n",
+            "export function task_0(input: number) {\n",
+            "  return input + 0;\n",
+            "}\n",
+            "// inserted line before task_1\n",
+            "export function task_1(input: number) {\n",
+            "  return input + 1;\n",
+            "}\n",
+        );
+        fs::write(&source_path, new_source).unwrap();
+
+        assert_eq!(
+            post_tool_use(&root, &input.file).unwrap(),
+            "Re-anchored src/stress.ts: 0 stale, 1 orphan."
+        );
+        let stored = load_dlog(&root, &input.file).unwrap().unwrap();
+        let decision = stored.decisions.get_str("fn:task_2").unwrap();
+        assert_eq!(decision.lines_hint, LineRange { start: 9, end: 11 });
+        assert_eq!(decision.status, Some(DecisionStatus::Orphan));
+        assert_eq!(
+            fs::read_to_string(dmap_path(&root, &input.file)).unwrap(),
+            "9-11:fn:task_2:ORPHAN\n"
         );
 
         let _ = fs::remove_dir_all(root);

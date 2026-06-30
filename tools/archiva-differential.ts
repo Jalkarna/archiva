@@ -6323,6 +6323,8 @@ results.push(await scenario("post-tool-use-shift", async (runtime) => {
   };
 }));
 
+results.push(await scenario("post-tool-use-sha256-git", postToolUseSha256GitScenario));
+
 results.push(await knownImprovementScenario(
   "post-tool-use-rename-improvement",
   async (runtime) => {
@@ -6496,6 +6498,44 @@ results.push(await scenario("deterministic-mutation-stress", async (runtime) => 
     files: normalizeFiles(await readProjectFiles(root, stressDecisionFiles(fileCount)))
   };
 }));
+
+async function postToolUseSha256GitScenario(runtime: Runtime): Promise<unknown> {
+  const root = await tempProject(runtime.name, "post-tool-use-sha256-git");
+  await fs.mkdir(path.join(root, "src"), { recursive: true });
+  await fs.writeFile(path.join(root, "src/sha256.ts"), "function kept() {\n  return 1;\n}\n", "utf8");
+  git(root, ["init", "--object-format=sha256"]);
+  git(root, ["add", "src/sha256.ts"]);
+  git(root, [
+    "-c",
+    "user.name=Archiva Test",
+    "-c",
+    "user.email=archiva@example.invalid",
+    "commit",
+    "-m",
+    "initial sha256"
+  ]);
+
+  const write = run(
+    runtime,
+    ["write-decision", "--json", JSON.stringify({
+      file: "src/sha256.ts",
+      anchor: "fn:kept",
+      lines: [1, 3],
+      chose: "keep sha256 function body",
+      because: "sha256 fixture",
+      rejected: []
+    })],
+    "",
+    root
+  );
+  await fs.writeFile(path.join(root, "src/sha256.ts"), "// inserted\nfunction kept() {\n  return 1;\n}\n", "utf8");
+  const post = run(runtime, ["hooks", "post-tool-use", "src/sha256.ts"], "", root);
+  return {
+    write,
+    post: normalizeVolatile(post),
+    files: normalizeFiles(await readProjectFiles(root, [".decisions/src/sha256.ts.dlog", ".decisions/src/sha256.ts.dmap"]))
+  };
+}
 
 const ok = results.every((result) => result.ok);
 console.log(JSON.stringify({ tool: "archiva-differential", status: ok ? "passed" : "failed", results }, null, 2));

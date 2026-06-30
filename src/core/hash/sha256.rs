@@ -14,25 +14,9 @@ const K: [u32; 64] = [
 ];
 
 pub fn digest(input: &[u8]) -> [u8; 32] {
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    let mut message = Vec::with_capacity(input.len() + 72);
-    message.extend_from_slice(input);
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_len.to_be_bytes());
-
-    let mut state = INITIAL_STATE;
-    for chunk in message.chunks_exact(64) {
-        compress(&mut state, chunk);
-    }
-
-    let mut output = [0_u8; 32];
-    for (index, word) in state.iter().enumerate() {
-        output[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    output
+    let mut sha256 = Sha256::new();
+    sha256.update(input);
+    sha256.finalize()
 }
 
 pub fn digest_hex(input: &[u8]) -> String {
@@ -47,6 +31,80 @@ pub fn hex(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+pub struct Sha256 {
+    state: [u32; 8],
+    length_bytes: u64,
+    buffer: [u8; 64],
+    buffer_len: usize,
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256 {
+    pub fn new() -> Self {
+        Self {
+            state: INITIAL_STATE,
+            length_bytes: 0,
+            buffer: [0; 64],
+            buffer_len: 0,
+        }
+    }
+
+    pub fn update(&mut self, mut input: &[u8]) {
+        self.length_bytes = self
+            .length_bytes
+            .checked_add(input.len() as u64)
+            .expect("SHA-256 input length overflow");
+        if self.buffer_len > 0 {
+            let needed = 64 - self.buffer_len;
+            let copied = needed.min(input.len());
+            self.buffer[self.buffer_len..self.buffer_len + copied]
+                .copy_from_slice(&input[..copied]);
+            self.buffer_len += copied;
+            input = &input[copied..];
+            if self.buffer_len == 64 {
+                compress(&mut self.state, &self.buffer);
+                self.buffer_len = 0;
+            }
+        }
+        while input.len() >= 64 {
+            compress(&mut self.state, &input[..64]);
+            input = &input[64..];
+        }
+        if !input.is_empty() {
+            self.buffer[..input.len()].copy_from_slice(input);
+            self.buffer_len = input.len();
+        }
+    }
+
+    pub fn finalize(mut self) -> [u8; 32] {
+        let bit_length = self
+            .length_bytes
+            .checked_mul(8)
+            .expect("SHA-256 bit length overflow");
+        self.buffer[self.buffer_len] = 0x80;
+        self.buffer_len += 1;
+        if self.buffer_len > 56 {
+            self.buffer[self.buffer_len..].fill(0);
+            compress(&mut self.state, &self.buffer);
+            self.buffer_len = 0;
+        }
+        self.buffer[self.buffer_len..56].fill(0);
+        self.buffer[56..64].copy_from_slice(&bit_length.to_be_bytes());
+        compress(&mut self.state, &self.buffer);
+
+        let mut output = [0_u8; 32];
+        for (index, word) in self.state.iter().enumerate() {
+            output[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        output
+    }
 }
 
 fn compress(state: &mut [u32; 8], chunk: &[u8]) {
