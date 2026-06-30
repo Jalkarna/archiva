@@ -660,11 +660,11 @@ function validatePostPublishSmokeWorkflowBehavior(file, text) {
     assert(body.includes("ARCHIVA_NATIVE_TARGET: ${{ matrix.target }}"), `${file} job ${jobName} must bind ARCHIVA_NATIVE_TARGET to the matrix target.`);
     assert(body.includes("NPM_CONFIG_INCLUDE: optional"), `${file} job ${jobName} must force optional native dependencies on.`);
     assert(body.includes("NPM_CONFIG_IGNORE_SCRIPTS: \"false\""), `${file} job ${jobName} must force postinstall scripts on.`);
-    assert(body.includes("node tools/smoke-native-package.mjs --published-spec"), `${file} job ${jobName} must run the full published package smoke helper.`);
     assert(body.includes("\"@jalkarna/archiva@$VERSION\""), `${file} job ${jobName} must smoke the published root package version.`);
+    if (jobName === "post-publish-musl-smoke") { assert(!body.includes("actions/checkout"), `${file} job ${jobName} must not use JavaScript checkout inside the Alpine container.`); assert(body.includes("npm install --include=optional --ignore-scripts=false \"@jalkarna/archiva@$VERSION\""), `${file} job ${jobName} must install the published root package in Alpine with optional dependencies and scripts enabled.`); assert(body.includes("node_modules/@jalkarna/archiva-${ARCHIVA_NATIVE_TARGET}/package.json"), `${file} job ${jobName} must assert the target musl native package was installed.`); assert(body.includes("node_modules/@jalkarna/archiva-${ARCHIVA_NATIVE_TARGET}/bin/archiva"), `${file} job ${jobName} must execute the target musl native binary.`); assert(body.includes("test \"$actual\" = \"$VERSION\""), `${file} job ${jobName} must verify the native binary version.`); continue; }
+    assert(body.includes("node tools/smoke-native-package.mjs --published-spec"), `${file} job ${jobName} must run the full published package smoke helper.`);
     assert(body.includes("--target \"${{ matrix.target }}\""), `${file} job ${jobName} must pass the matrix target to the smoke helper.`);
-    assert(!body.includes("archiva --version"), `${file} job ${jobName} must not regress to version-only smoke.`);
-  }
+    assert(!body.includes("archiva --version"), `${file} job ${jobName} must not regress to version-only smoke.`); }
 }
 
 function validatePublishMetaWorkflowBehavior(file, text) {
