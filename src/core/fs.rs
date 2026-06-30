@@ -235,6 +235,7 @@ impl FileLock {
     fn release_inner(&mut self) -> Result<()> {
         let content = match read_lock_file(&self.path, "read lock file before release")? {
             LockFileRead::Missing | LockFileRead::Oversized => return Ok(()),
+            LockFileRead::UnreadableContention => return Err(existing_lock_error(&self.path)),
             LockFileRead::Content(content) => content,
         };
         if parse_lock_metadata(&content).token.as_deref() != Some(self.token.as_str()) {
@@ -364,12 +365,16 @@ enum LockFileRead {
     Missing,
     Content(String),
     Oversized,
+    UnreadableContention,
 }
 
 fn read_lock_file(lock_path: &Path, action: &'static str) -> Result<LockFileRead> {
     let file = match File::open(lock_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(LockFileRead::Missing),
+        Err(error) if lock_read_error_is_contention(lock_path, &error)? => {
+            return Ok(LockFileRead::UnreadableContention);
+        }
         Err(source) => {
             return Err(ArchivaError::io(
                 Some(lock_path.to_path_buf()),
@@ -401,7 +406,15 @@ fn lock_file_read_is_recoverable(
             lock_is_recoverable(lock_path, content, contender_timestamp)
         }
         LockFileRead::Oversized => lock_file_modified_is_expired(lock_path, contender_timestamp),
+        LockFileRead::UnreadableContention => Ok(false),
     }
+}
+
+fn lock_read_error_is_contention(lock_path: &Path, error: &io::Error) -> Result<bool> {
+    if error.kind() == io::ErrorKind::PermissionDenied && path_exists(lock_path)? {
+        return Ok(true);
+    }
+    Ok(cfg!(windows) && error.raw_os_error() == Some(5))
 }
 
 fn lock_is_recoverable(lock_path: &Path, content: &str, contender_timestamp: &str) -> Result<bool> {
@@ -805,12 +818,13 @@ mod tests {
     use super::{
         acquire_file_lock, acquire_file_lock_now, acquire_stale_recovery_lock, atomic_write_text,
         atomic_write_text_with_test_fault, ensure_parent_dir, list_files, list_storage_files,
-        path_exists, read_text_file_with_limit, read_text_if_exists,
+        lock_read_error_is_contention, path_exists, read_text_file_with_limit, read_text_if_exists,
         read_text_if_exists_with_limit, recover_stale_lock, stale_recovery_lock_path,
         AtomicWriteTestFault, AtomicWriteTestStage, LOCK_METADATA_MAX_BYTES,
     };
     use crate::core::dlog::parse_dlog_yaml;
     use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -883,6 +897,22 @@ mod tests {
 
         lock.release().unwrap();
         assert!(!lock_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn classifies_permission_denied_lock_read_as_contention_for_existing_lock() {
+        let root = unique_temp_dir("archiva-fs-lock-read-contention");
+        let lock_path = root.join(".decisions").join("src").join("a.ts.lock");
+        ensure_parent_dir(&lock_path).unwrap();
+        fs::write(&lock_path, "version=1\n").unwrap();
+
+        assert!(lock_read_error_is_contention(
+            &lock_path,
+            &io::Error::from(io::ErrorKind::PermissionDenied)
+        )
+        .unwrap());
+
         let _ = fs::remove_dir_all(root);
     }
 
