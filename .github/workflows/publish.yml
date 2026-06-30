@@ -80,22 +80,30 @@ jobs:
       - name: Rust property soak
         run: npm run property:soak
 
-      - name: Build native package
-        run: npm run build:rust
+      - name: Build package artifacts
+        run: npm run build
 
       - name: Native differential
-        run: npm run differential:release | tee archiva-differential.json
+        run: |
+          set -o pipefail
+          npm run differential:release | tee archiva-differential.json
 
       - name: Native stress soak
-        run: npm run stress:soak | tee archiva-stress-soak.json
+        run: |
+          set -o pipefail
+          npm run stress:soak | tee archiva-stress-soak.json
 
       - name: Benchmark comparison
         timeout-minutes: 20
-        run: npm run --silent benchmark:compare | tee archiva-benchmark.json
+        run: |
+          set -o pipefail
+          npm run --silent benchmark:compare | tee archiva-benchmark.json
 
       - name: Synthetic scale smoke
         timeout-minutes: 20
-        run: npm run --silent scale:smoke | tee archiva-scale-smoke.json
+        run: |
+          set -o pipefail
+          npm run --silent scale:smoke | tee archiva-scale-smoke.json
 
       - name: Combined seeded scale
         timeout-minutes: 60
@@ -112,7 +120,9 @@ jobs:
           ARCHIVA_SCALE_SEEDED_DECISIONS_PER_FILE: "10"
           ARCHIVA_SCALE_SEEDED_MUTATE_FILES: "1000"
           ARCHIVA_SCALE_COMMAND_MAX_BUFFER_MB: "2048"
-        run: npm run --silent scale:smoke | tee archiva-scale-seeded.json
+        run: |
+          set -o pipefail
+          npm run --silent scale:smoke | tee archiva-scale-seeded.json
 
       - name: Checkout external corpus
         uses: actions/checkout@v7
@@ -126,6 +136,7 @@ jobs:
       - name: External corpus scale
         timeout-minutes: 45
         run: |
+          set -o pipefail
           ARCHIVA_SCALE_CORPUS_ROOT="$GITHUB_WORKSPACE/corpus" \
             npm run --silent scale:corpus | tee archiva-scale-corpus.json
 
@@ -136,6 +147,7 @@ jobs:
           ARCHIVA_SCALE_CORPUS_DECISIONS: "24"
           ARCHIVA_SCALE_CORPUS_MUTATE_FILES: "16"
         run: |
+          set -o pipefail
           ARCHIVA_SCALE_CORPUS_ROOT="$GITHUB_WORKSPACE/src" \
             npm run --silent scale:corpus:rust | tee archiva-scale-rust-corpus.json
 
