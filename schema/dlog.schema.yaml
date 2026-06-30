@@ -1,3 +1,4 @@
+# Mirrors validation in src/core/dlog.ts (Zod). Keep in sync when extending DecisionRecord.
 type: object
 required:
   - file
@@ -6,6 +7,7 @@ required:
 properties:
   file:
     type: string
+    minLength: 1
   schema:
     const: 1
   decisions:
@@ -21,3 +23,72 @@ properties:
         - rejected
         - timestamp
         - history
+      properties:
+        id:
+          type: string
+          minLength: 1
+        lines_hint:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            type: integer
+            minimum: 1
+        fingerprint:
+          type: string
+          minLength: 1
+        chose:
+          type: string
+          minLength: 1
+        because:
+          type: string
+          minLength: 1
+        rejected:
+          type: array
+          items:
+            type: object
+            required:
+              - approach
+              - reason
+            properties:
+              approach:
+                type: string
+                minLength: 1
+              reason:
+                type: string
+                minLength: 1
+        expires_if:
+          type: string
+        session:
+          type: string
+        timestamp:
+          type: string
+          minLength: 1
+        history:
+          type: array
+          items:
+            type: object
+            required:
+              - id
+              - chose
+            properties:
+              id:
+                type: string
+              chose:
+                type: string
+              because:
+                type: string
+              timestamp:
+                type: string
+              superseded_reason:
+                type: string
+        status:
+          type: string
+          enum:
+            - UNDECIDED
+            - STALE
+            - ORPHAN
+        stale_since:
+          type: string
+        supersedes:
+          type: string

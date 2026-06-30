@@ -1,14 +1,23 @@
 import { Node, Project, SourceFile, SyntaxKind } from "ts-morph";
 import type { AnchorInfo } from "./types.js";
 
+let sharedProject: Project | undefined;
+
+function getSharedProject(): Project {
+  if (!sharedProject) {
+    sharedProject = new Project({
+      useInMemoryFileSystem: true,
+      compilerOptions: {
+        allowJs: true,
+        checkJs: false
+      }
+    });
+  }
+  return sharedProject;
+}
+
 export function extractAnchors(filePath: string, content: string): Record<string, AnchorInfo> {
-  const project = new Project({
-    useInMemoryFileSystem: true,
-    compilerOptions: {
-      allowJs: true,
-      checkJs: false
-    }
-  });
+  const project = getSharedProject();
   const sourceFile = project.createSourceFile(filePath, content, { overwrite: true });
   const anchors = new Map<string, AnchorInfo>();
   const counts = new Map<string, number>();
@@ -95,8 +104,15 @@ export function cyclomaticComplexity(node: Node): number {
         complexity += 1;
         break;
       case SyntaxKind.BinaryExpression: {
-        const text = descendant.getText();
-        if (text.includes("&&") || text.includes("||") || text.includes("??")) complexity += 1;
+        if (!Node.isBinaryExpression(descendant)) break;
+        const op = descendant.getOperatorToken().getKind();
+        if (
+          op === SyntaxKind.AmpersandAmpersandToken ||
+          op === SyntaxKind.BarBarToken ||
+          op === SyntaxKind.QuestionQuestionToken
+        ) {
+          complexity += 1;
+        }
         break;
       }
     }

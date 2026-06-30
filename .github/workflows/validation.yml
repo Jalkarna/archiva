@@ -1,0 +1,148 @@
+name: Heavy validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      corpus_repository:
+        description: External corpus repository.
+        required: true
+        default: microsoft/TypeScript
+      corpus_ref:
+        description: External corpus commit, branch, or tag.
+        required: true
+        default: 637d5746b70257028fb95aad32ddec6b26ab0a14
+      sparse_paths:
+        description: Newline-separated sparse checkout paths.
+        required: true
+        default: src
+      corpus_language:
+        description: Corpus language mode, auto, typescript, or rust.
+        required: true
+        default: auto
+      corpus_files:
+        description: Maximum corpus source files to copy.
+        required: true
+        default: "80"
+      corpus_decisions:
+        description: Number of corpus decisions to write.
+        required: true
+        default: "30"
+      corpus_mutate_files:
+        description: Number of corpus decision files to mutate.
+        required: true
+        default: "20"
+  schedule:
+    - cron: "0 7 * * 1"
+
+jobs:
+  heavy-validation:
+    runs-on: ubuntu-latest
+    env:
+      ARCHIVA_CORPUS_REPOSITORY: ${{ github.event.inputs.corpus_repository || 'microsoft/TypeScript' }}
+      ARCHIVA_CORPUS_REF: ${{ github.event.inputs.corpus_ref || '637d5746b70257028fb95aad32ddec6b26ab0a14' }}
+      ARCHIVA_CORPUS_SPARSE_PATHS: ${{ github.event.inputs.sparse_paths || 'src' }}
+      ARCHIVA_SCALE_CORPUS_LANGUAGE: ${{ github.event.inputs.corpus_language || 'auto' }}
+      ARCHIVA_SCALE_CORPUS_FILES: ${{ github.event.inputs.corpus_files || '80' }}
+      ARCHIVA_SCALE_CORPUS_DECISIONS: ${{ github.event.inputs.corpus_decisions || '30' }}
+      ARCHIVA_SCALE_CORPUS_MUTATE_FILES: ${{ github.event.inputs.corpus_mutate_files || '20' }}
+      ARCHIVA_BENCHMARK_COMPARE_TIMEOUT_MS: "900000"
+      ARCHIVA_BASELINE_COMMAND_TIMEOUT_MS: "300000"
+      ARCHIVA_SCALE_COMMAND_TIMEOUT_MS: "600000"
+    steps:
+      - name: Checkout Archiva
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.96.0
+
+      - name: Install
+        run: npm ci
+
+      - name: Check
+        run: npm run check
+
+      - name: Rust property soak
+        run: npm run property:soak
+
+      - name: Build native package
+        run: npm run build:rust
+
+      - name: Package smoke test
+        run: npm run smoke:package
+
+      - name: Native differential
+        run: npm run differential:release | tee archiva-differential.json
+
+      - name: Native stress soak
+        run: npm run stress:soak | tee archiva-stress-soak.json
+
+      - name: Benchmark comparison
+        timeout-minutes: 20
+        run: npm run --silent benchmark:compare | tee archiva-benchmark.json
+
+      - name: Synthetic scale smoke
+        timeout-minutes: 20
+        run: npm run --silent scale:smoke | tee archiva-scale-smoke.json
+
+      - name: Combined seeded scale
+        timeout-minutes: 60
+        env:
+          ARCHIVA_SCALE_FILES: "2"
+          ARCHIVA_SCALE_DECISIONS: "2"
+          ARCHIVA_SCALE_MUTATE_FILES: "1"
+          ARCHIVA_SCALE_PARITY_FILES: "1"
+          ARCHIVA_SCALE_PARITY_DECISIONS: "1"
+          ARCHIVA_SCALE_PARITY_MUTATE_FILES: "1"
+          ARCHIVA_SCALE_SEEDED: "1"
+          ARCHIVA_SCALE_SEEDED_FILES: "100000"
+          ARCHIVA_SCALE_SEEDED_DECISIONS: "1000000"
+          ARCHIVA_SCALE_SEEDED_DECISIONS_PER_FILE: "10"
+          ARCHIVA_SCALE_SEEDED_MUTATE_FILES: "1000"
+          ARCHIVA_SCALE_COMMAND_MAX_BUFFER_MB: "2048"
+        run: npm run --silent scale:smoke | tee archiva-scale-seeded.json
+
+      - name: Checkout external corpus
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.ARCHIVA_CORPUS_REPOSITORY }}
+          ref: ${{ env.ARCHIVA_CORPUS_REF }}
+          path: corpus
+          sparse-checkout: ${{ env.ARCHIVA_CORPUS_SPARSE_PATHS }}
+          sparse-checkout-cone-mode: false
+
+      - name: External corpus scale
+        timeout-minutes: 45
+        run: |
+          ARCHIVA_SCALE_CORPUS_ROOT="$GITHUB_WORKSPACE/corpus" \
+            npm run --silent scale:corpus | tee archiva-scale-corpus.json
+
+      - name: Rust self-corpus scale
+        timeout-minutes: 20
+        env:
+          ARCHIVA_SCALE_CORPUS_FILES: "40"
+          ARCHIVA_SCALE_CORPUS_DECISIONS: "24"
+          ARCHIVA_SCALE_CORPUS_MUTATE_FILES: "16"
+        run: |
+          ARCHIVA_SCALE_CORPUS_ROOT="$GITHUB_WORKSPACE/src" \
+            npm run --silent scale:corpus:rust | tee archiva-scale-rust-corpus.json
+
+      - name: Upload validation artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: archiva-heavy-validation
+          path: |
+            archiva-differential.json
+            archiva-stress-soak.json
+            archiva-benchmark.json
+            archiva-scale-smoke.json
+            archiva-scale-seeded.json
+            archiva-scale-corpus.json
+            archiva-scale-rust-corpus.json

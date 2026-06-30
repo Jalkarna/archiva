@@ -1,6 +1,7 @@
 node_modules/
 dist/
 coverage/
+target/
 .cache/
 .turbo/
 .next/
@@ -28,4 +29,5 @@ NOTES.md
 *.local.md
 
 # Package artifacts
+dist-native/
 *.tgz

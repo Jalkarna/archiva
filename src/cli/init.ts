@@ -28,6 +28,18 @@ If changing code that has an existing decision:
 - If your change invalidates the reasoning -> call \`write_decision\` with \`supersedes: <id>\`
 `;
 
+type HookCommand = { type: string; command: string };
+type HookGroup = { hooks: HookCommand[]; matcher?: string };
+
+const ARCHIVA_SESSION_START: HookGroup = {
+  hooks: [{ type: "command", command: "archiva hooks session-start" }]
+};
+
+const ARCHIVA_POST_TOOL_USE: HookGroup = {
+  matcher: "Write|Edit|MultiEdit",
+  hooks: [{ type: "command", command: "archiva hooks post-tool-use" }]
+};
+
 export async function initProject(projectRoot: string, options: { gitignoreDecisions?: boolean } = {}): Promise<string> {
   await fs.mkdir(path.join(projectRoot, ".decisions"), { recursive: true });
   await writeClaudeSettings(projectRoot);
@@ -44,18 +56,12 @@ async function writeClaudeSettings(projectRoot: string): Promise<void> {
     settings = JSON.parse(await fs.readFile(settingsPath, "utf8")) as Record<string, unknown>;
   }
 
+  const existingHooks =
+    settings.hooks && typeof settings.hooks === "object" ? (settings.hooks as Record<string, HookGroup[]>) : {};
   settings.hooks = {
-    SessionStart: [
-      {
-        hooks: [{ type: "command", command: "archiva hooks session-start" }]
-      }
-    ],
-    PostToolUse: [
-      {
-        matcher: "Write|Edit|MultiEdit",
-        hooks: [{ type: "command", command: "archiva hooks post-tool-use" }]
-      }
-    ]
+    ...existingHooks,
+    SessionStart: mergeHookGroups(existingHooks.SessionStart, [ARCHIVA_SESSION_START]),
+    PostToolUse: mergeHookGroups(existingHooks.PostToolUse, [ARCHIVA_POST_TOOL_USE])
   };
   settings.mcpServers = {
     ...(typeof settings.mcpServers === "object" && settings.mcpServers ? settings.mcpServers : {}),
@@ -66,6 +72,37 @@ async function writeClaudeSettings(projectRoot: string): Promise<void> {
   };
 
   await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+}
+
+function mergeHookGroups(existing: HookGroup[] | undefined, incoming: HookGroup[]): HookGroup[] {
+  const current = (existing ?? []).map((group) => ({
+    ...group,
+    hooks: [...(group.hooks ?? [])]
+  }));
+
+  for (const group of incoming) {
+    const command = group.hooks[0]?.command;
+    if (!command) continue;
+
+    if (group.matcher) {
+      const matchGroup = current.find((entry) => entry.matcher === group.matcher);
+      if (matchGroup) {
+        if (!matchGroup.hooks.some((hook) => hook.command === command)) {
+          matchGroup.hooks.push(...group.hooks);
+        }
+      } else {
+        current.push({ matcher: group.matcher, hooks: [...group.hooks] });
+      }
+      continue;
+    }
+
+    const hasCommand = current.some((entry) => entry.hooks.some((hook) => hook.command === command));
+    if (!hasCommand) {
+      current.push({ hooks: [...group.hooks] });
+    }
+  }
+
+  return current;
 }
 
 async function appendAgentsBlock(projectRoot: string): Promise<void> {

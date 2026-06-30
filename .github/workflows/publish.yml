@@ -5,15 +5,237 @@ on:
   release:
     types: [published]
 
+concurrency:
+  group: publish-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
-  npm:
-    runs-on: ubuntu-latest
+  heavy-validation:
+    runs-on: ubuntu-22.04
+    env:
+      ARCHIVA_RELEASE_TAG: ${{ github.event.release.tag_name || '' }}
+      ARCHIVA_CORPUS_REPOSITORY: microsoft/TypeScript
+      ARCHIVA_CORPUS_REF: 637d5746b70257028fb95aad32ddec6b26ab0a14
+      ARCHIVA_CORPUS_SPARSE_PATHS: src
+      ARCHIVA_SCALE_CORPUS_LANGUAGE: auto
+      ARCHIVA_SCALE_CORPUS_FILES: "80"
+      ARCHIVA_SCALE_CORPUS_DECISIONS: "30"
+      ARCHIVA_SCALE_CORPUS_MUTATE_FILES: "20"
+      ARCHIVA_BENCHMARK_COMPARE_TIMEOUT_MS: "900000"
+      ARCHIVA_BASELINE_COMMAND_TIMEOUT_MS: "300000"
+      ARCHIVA_SCALE_COMMAND_TIMEOUT_MS: "600000"
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout Archiva
+        uses: actions/checkout@v7
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.96.0
+
+      - name: Install
+        run: npm ci
+
+      - name: Verify release version
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const packageVersion = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
+          const cargo = fs.readFileSync("Cargo.toml", "utf8");
+          const cargoVersion = cargo.match(/^version = "([^"]+)"$/m)?.[1];
+          if (cargoVersion !== packageVersion) {
+            throw new Error(`Cargo.toml version ${cargoVersion ?? "<missing>"} does not match package.json ${packageVersion}.`);
+          }
+
+          const releaseTag = process.env.ARCHIVA_RELEASE_TAG;
+          const expectedTag = `v${packageVersion}`;
+          if (releaseTag) {
+            if (releaseTag !== expectedTag) {
+              throw new Error(`Release tag ${releaseTag} does not match package version ${packageVersion}; expected ${expectedTag}.`);
+            }
+          } else if (process.env.GITHUB_EVENT_NAME === "workflow_dispatch") {
+            const expectedRef = `refs/tags/${expectedTag}`;
+            if (process.env.GITHUB_REF !== expectedRef) {
+              throw new Error(`Manual publish must run from ${expectedRef}; got ${process.env.GITHUB_REF ?? "<missing>"}.`);
+            }
+          }
+          NODE
+
+      - name: Check
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+      - name: Rust property soak
+        run: npm run property:soak
+
+      - name: Build native package
+        run: npm run build:rust
+
+      - name: Native differential
+        run: npm run differential:release | tee archiva-differential.json
+
+      - name: Native stress soak
+        run: npm run stress:soak | tee archiva-stress-soak.json
+
+      - name: Benchmark comparison
+        timeout-minutes: 20
+        run: npm run --silent benchmark:compare | tee archiva-benchmark.json
+
+      - name: Synthetic scale smoke
+        timeout-minutes: 20
+        run: npm run --silent scale:smoke | tee archiva-scale-smoke.json
+
+      - name: Combined seeded scale
+        timeout-minutes: 60
+        env:
+          ARCHIVA_SCALE_FILES: "2"
+          ARCHIVA_SCALE_DECISIONS: "2"
+          ARCHIVA_SCALE_MUTATE_FILES: "1"
+          ARCHIVA_SCALE_PARITY_FILES: "1"
+          ARCHIVA_SCALE_PARITY_DECISIONS: "1"
+          ARCHIVA_SCALE_PARITY_MUTATE_FILES: "1"
+          ARCHIVA_SCALE_SEEDED: "1"
+          ARCHIVA_SCALE_SEEDED_FILES: "100000"
+          ARCHIVA_SCALE_SEEDED_DECISIONS: "1000000"
+          ARCHIVA_SCALE_SEEDED_DECISIONS_PER_FILE: "10"
+          ARCHIVA_SCALE_SEEDED_MUTATE_FILES: "1000"
+          ARCHIVA_SCALE_COMMAND_MAX_BUFFER_MB: "2048"
+        run: npm run --silent scale:smoke | tee archiva-scale-seeded.json
+
+      - name: Checkout external corpus
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.ARCHIVA_CORPUS_REPOSITORY }}
+          ref: ${{ env.ARCHIVA_CORPUS_REF }}
+          path: corpus
+          sparse-checkout: ${{ env.ARCHIVA_CORPUS_SPARSE_PATHS }}
+          sparse-checkout-cone-mode: false
+
+      - name: External corpus scale
+        timeout-minutes: 45
+        run: |
+          ARCHIVA_SCALE_CORPUS_ROOT="$GITHUB_WORKSPACE/corpus" \
+            npm run --silent scale:corpus | tee archiva-scale-corpus.json
+
+      - name: Rust self-corpus scale
+        timeout-minutes: 20
+        env:
+          ARCHIVA_SCALE_CORPUS_FILES: "40"
+          ARCHIVA_SCALE_CORPUS_DECISIONS: "24"
+          ARCHIVA_SCALE_CORPUS_MUTATE_FILES: "16"
+        run: |
+          ARCHIVA_SCALE_CORPUS_ROOT="$GITHUB_WORKSPACE/src" \
+            npm run --silent scale:corpus:rust | tee archiva-scale-rust-corpus.json
+
+      - name: Upload validation artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: archiva-publish-heavy-validation
+          path: |
+            archiva-differential.json
+            archiva-stress-soak.json
+            archiva-benchmark.json
+            archiva-scale-smoke.json
+            archiva-scale-seeded.json
+            archiva-scale-corpus.json
+            archiva-scale-rust-corpus.json
+
+  publish-native:
+    name: Publish native ${{ matrix.target }}
+    needs: heavy-validation
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64-gnu
+            rust_target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            binary: target/x86_64-unknown-linux-gnu/release/archiva
+          - target: linux-x64-musl
+            rust_target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            binary: target/x86_64-unknown-linux-musl/release/archiva
+          - target: linux-arm64-gnu
+            rust_target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            binary: target/aarch64-unknown-linux-gnu/release/archiva
+          - target: linux-arm64-musl
+            rust_target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            binary: target/aarch64-unknown-linux-musl/release/archiva
+          - target: darwin-x64
+            rust_target: x86_64-apple-darwin
+            runner: macos-15-intel
+            binary: target/x86_64-apple-darwin/release/archiva
+          - target: darwin-arm64
+            rust_target: aarch64-apple-darwin
+            runner: macos-15
+            binary: target/aarch64-apple-darwin/release/archiva
+          - target: win32-x64-msvc
+            rust_target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            binary: target/x86_64-pc-windows-msvc/release/archiva.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+          rustup default 1.96.0
+          rustup target add ${{ matrix.rust_target }}
+
+      - name: Install
+        run: npm ci
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.rust_target }}
+
+      - name: Stage native package
+        run: node tools/stage-native-package.mjs --target ${{ matrix.target }} --binary "${{ matrix.binary }}"
+
+      - name: Smoke native package
+        env:
+          ARCHIVA_NATIVE_TARGET: ${{ matrix.target }}
+          NPM_CONFIG_INCLUDE: optional
+          NPM_CONFIG_IGNORE_SCRIPTS: "false"
+        run: npm run smoke:package -- --target ${{ matrix.target }}
+
+      - name: Publish native package
+        env:
+          ARCHIVA_NATIVE_TARGET: ${{ matrix.target }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node tools/npm-publish-idempotent.mjs --native-target "${{ matrix.target }}"
+
+  publish-meta:
+    needs: publish-native
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
@@ -22,13 +244,91 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Typecheck
-        run: npm run check
+      - name: Verify native packages are published
+        run: node tools/npm-publish-idempotent.mjs --verify-native-targets
 
-      - name: Test
-        run: npm test
+      - name: Stage meta package
+        run: node tools/stage-native-package.mjs --meta-only
 
-      - name: Publish
-        run: npm publish --access public
+      - name: Smoke packed meta package
+        env:
+          ARCHIVA_NATIVE_TARGET: linux-x64-gnu
+          NPM_CONFIG_INCLUDE: optional
+          NPM_CONFIG_IGNORE_SCRIPTS: "false"
+        run: |
+          VERSION="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")"
+          tmpdir="$(mktemp -d)"
+          npm pack --pack-destination "$tmpdir" --silent
+          pkg="$(find "$tmpdir" -maxdepth 1 -name '*.tgz' -print -quit)"
+          node tools/smoke-native-package.mjs --published-spec "$pkg" --expected-version "$VERSION" --target linux-x64-gnu
+
+      - name: Publish meta package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node tools/npm-publish-idempotent.mjs --root
+
+  post-publish-smoke:
+    needs: publish-meta
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64-gnu
+            runner: ubuntu-22.04
+          - target: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: darwin-arm64
+            runner: macos-15
+          - target: win32-x64-msvc
+            runner: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install published package
+        shell: bash
+        env:
+          ARCHIVA_NATIVE_TARGET: ${{ matrix.target }}
+          NPM_CONFIG_INCLUDE: optional
+          NPM_CONFIG_IGNORE_SCRIPTS: "false"
+        run: |
+          VERSION="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")"
+          node tools/smoke-native-package.mjs --published-spec "@jalkarna/archiva@$VERSION" --expected-version "$VERSION" --target "${{ matrix.target }}"
+
+  post-publish-musl-smoke:
+    needs: publish-meta
+    name: Post-publish musl smoke ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    container: node:20-alpine
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64-musl
+            runner: ubuntu-22.04
+          - target: linux-arm64-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Install checkout dependencies
+        run: apk add --no-cache git
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install published package on musl
+        env:
+          ARCHIVA_NATIVE_TARGET: ${{ matrix.target }}
+          NPM_CONFIG_INCLUDE: optional
+          NPM_CONFIG_IGNORE_SCRIPTS: "false"
+        run: |
+          VERSION="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")"
+          node tools/smoke-native-package.mjs --published-spec "@jalkarna/archiva@$VERSION" --expected-version "$VERSION" --target "${{ matrix.target }}"

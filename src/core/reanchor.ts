@@ -1,14 +1,11 @@
-import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
-import { promisify } from "node:util";
 import { diffLines } from "diff";
 import { extractAnchors } from "./anchor.js";
+import { clearRecoveredStatus, isFingerprintStale, markOrphan, markStale } from "./decision-status.js";
 import { loadDlog, writeDlog } from "./dlog.js";
 import { writeDmap } from "./dmap.js";
-import { fingerprint, getLines } from "./fingerprint.js";
+import { readGitHeadFile } from "./git.js";
 import { sourcePath } from "./paths.js";
-
-const execFileAsync = promisify(execFile);
 
 export async function postToolUse(projectRoot: string, file: string): Promise<string> {
   const dlog = await loadDlog(projectRoot, file);
@@ -16,27 +13,25 @@ export async function postToolUse(projectRoot: string, file: string): Promise<st
 
   const fullPath = sourcePath(projectRoot, file);
   const newContent = await fs.readFile(fullPath, "utf8");
-  const oldContent = await readGitHead(projectRoot, file).catch(() => newContent);
+  const oldContent = await readGitHeadFile(projectRoot, file).catch(() => newContent);
   const anchors = extractAnchors(file, newContent);
 
   let stale = 0;
   let orphan = 0;
   for (const [anchor, decision] of Object.entries(dlog.decisions)) {
+    decision.lines_hint = applyDiffToRange(oldContent, newContent, decision.lines_hint);
+
     if (!anchors[anchor]) {
-      decision.status = "ORPHAN";
+      markOrphan(decision);
       orphan += 1;
       continue;
     }
 
-    decision.lines_hint = applyDiffToRange(oldContent, newContent, decision.lines_hint);
-    const currentFingerprint = fingerprint(getLines(newContent, decision.lines_hint));
-    if (currentFingerprint !== decision.fingerprint) {
-      if (decision.status !== "STALE") decision.stale_since = new Date().toISOString();
-      decision.status = "STALE";
+    if (isFingerprintStale(newContent, decision)) {
+      markStale(decision);
       stale += 1;
-    } else if (decision.status === "STALE") {
-      delete decision.status;
-      delete decision.stale_since;
+    } else if (clearRecoveredStatus(decision)) {
+      // recovered from STALE or ORPHAN
     }
   }
 
@@ -72,12 +67,4 @@ function lineCount(value: string): number {
   if (!value) return 0;
   const normalized = value.endsWith("\n") ? value.slice(0, -1) : value;
   return normalized.length === 0 ? 0 : normalized.split(/\r?\n/).length;
-}
-
-async function readGitHead(projectRoot: string, file: string): Promise<string> {
-  const { stdout } = await execFileAsync("git", ["show", `HEAD:${file}`], {
-    cwd: projectRoot,
-    maxBuffer: 10 * 1024 * 1024
-  });
-  return stdout;
 }

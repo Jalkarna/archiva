@@ -7,7 +7,7 @@ import { writeDecision, why, whyForLine } from "../src/core/decision.js";
 import { loadDlog } from "../src/core/dlog.js";
 import { loadDmap, parseDmap, renderDmap } from "../src/core/dmap.js";
 import { fingerprint } from "../src/core/fingerprint.js";
-import { applyDiffToRange } from "../src/core/reanchor.js";
+import { postToolUse, applyDiffToRange } from "../src/core/reanchor.js";
 import { lintProject } from "../src/lint/rules.js";
 
 describe("dmap", () => {
@@ -104,6 +104,55 @@ describe("decisions", () => {
     expect(issues.some((issue) => issue.rule === "arc/undecided" && issue.anchor === "fn:consumeToken")).toBe(true);
   });
 
+  it("clears stale status when code is reverted to the recorded fingerprint", async () => {
+    const root = await tempProject();
+    await fs.mkdir(path.join(root, "src"), { recursive: true });
+    const filePath = path.join(root, "src/revert.ts");
+    const original = "function kept() {\n  return 1;\n}\n";
+    await fs.writeFile(filePath, original, "utf8");
+    await writeDecision(root, {
+      file: "src/revert.ts",
+      anchor: "fn:kept",
+      lines: [1, 3],
+      chose: "initial kept behavior",
+      because: "fixture setup",
+      rejected: []
+    });
+
+    await fs.writeFile(filePath, "function kept() {\n  return 42;\n}\n", "utf8");
+    const staleIssues = await lintProject(root);
+    expect(staleIssues.some((issue) => issue.rule === "arc/stale")).toBe(true);
+
+    await fs.writeFile(filePath, original, "utf8");
+    const cleared = await lintProject(root);
+    expect(cleared.some((issue) => issue.rule === "arc/stale")).toBe(false);
+    const dlog = await loadDlog(root, "src/revert.ts");
+    expect(dlog?.decisions["fn:kept"]?.status).toBeUndefined();
+  });
+
+  it("emits arc/supersede only after a decision is already marked stale", async () => {
+    const root = await tempProject();
+    await fs.mkdir(path.join(root, "src"), { recursive: true });
+    const filePath = path.join(root, "src/supersede.ts");
+    await fs.writeFile(filePath, "function kept() {\n  return 1;\n}\n", "utf8");
+    await writeDecision(root, {
+      file: "src/supersede.ts",
+      anchor: "fn:kept",
+      lines: [1, 3],
+      chose: "initial",
+      because: "fixture",
+      rejected: []
+    });
+
+    await fs.writeFile(filePath, "function kept() {\n  return 99;\n}\n", "utf8");
+    const first = await lintProject(root);
+    expect(first.some((issue) => issue.rule === "arc/stale")).toBe(true);
+    expect(first.some((issue) => issue.rule === "arc/supersede")).toBe(false);
+
+    const second = await lintProject(root);
+    expect(second.some((issue) => issue.rule === "arc/supersede")).toBe(true);
+  });
+
   it("reports stale and orphaned decisions", async () => {
     const root = await tempProject();
     await fs.mkdir(path.join(root, "src"), { recursive: true });
@@ -178,6 +227,31 @@ describe("fingerprints and reanchor", () => {
   it("normalizes whitespace and shifts ranges for insertions before anchors", () => {
     expect(fingerprint("const x = 1;\n")).toBe(fingerprint("  const   x   =   1;\n\n"));
     expect(applyDiffToRange("a\nb\nc\n", "a\nx\nb\nc\n", [2, 3])).toEqual([3, 4]);
+  });
+
+  it("clears ORPHAN when a removed anchor returns", async () => {
+    const root = await tempProject();
+    await fs.mkdir(path.join(root, "src"), { recursive: true });
+    const filePath = path.join(root, "src/orphan-return.ts");
+    const withBoth = "function kept() {\n  return 1;\n}\nfunction removed() {\n  return 2;\n}\n";
+    await fs.writeFile(filePath, withBoth, "utf8");
+    await writeDecision(root, {
+      file: "src/orphan-return.ts",
+      anchor: "fn:removed",
+      lines: [4, 6],
+      chose: "keep removed",
+      because: "fixture",
+      rejected: []
+    });
+
+    await fs.writeFile(filePath, "function kept() {\n  return 1;\n}\n", "utf8");
+    await postToolUse(root, "src/orphan-return.ts");
+
+    await fs.writeFile(filePath, withBoth, "utf8");
+    await postToolUse(root, "src/orphan-return.ts");
+
+    const dlog = await loadDlog(root, "src/orphan-return.ts");
+    expect(dlog?.decisions["fn:removed"]?.status).toBeUndefined();
   });
 });
 

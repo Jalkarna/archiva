@@ -6,17 +6,117 @@ on:
   pull_request:
 
 jobs:
+  rust-cross-platform:
+    name: Rust ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.96.0
+
+      - name: Build Rust
+        run: cargo build --all-targets --locked
+
+      - name: Test Rust
+        run: cargo test --all-targets --locked --quiet
+
+  native-package:
+    name: Native package ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64-gnu
+            rust_target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            binary: target/x86_64-unknown-linux-gnu/release/archiva
+          - target: linux-x64-musl
+            rust_target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            binary: target/x86_64-unknown-linux-musl/release/archiva
+          - target: linux-arm64-gnu
+            rust_target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            binary: target/aarch64-unknown-linux-gnu/release/archiva
+          - target: linux-arm64-musl
+            rust_target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            binary: target/aarch64-unknown-linux-musl/release/archiva
+          - target: darwin-x64
+            rust_target: x86_64-apple-darwin
+            runner: macos-15-intel
+            binary: target/x86_64-apple-darwin/release/archiva
+          - target: darwin-arm64
+            rust_target: aarch64-apple-darwin
+            runner: macos-15
+            binary: target/aarch64-apple-darwin/release/archiva
+          - target: win32-x64-msvc
+            rust_target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            binary: target/x86_64-pc-windows-msvc/release/archiva.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.96.0
+          rustup target add ${{ matrix.rust_target }}
+
+      - name: Install
+        run: npm ci
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.rust_target }}
+
+      - name: Stage native package
+        run: node tools/stage-native-package.mjs --target ${{ matrix.target }} --binary "${{ matrix.binary }}"
+
+      - name: Smoke native package
+        env:
+          ARCHIVA_NATIVE_TARGET: ${{ matrix.target }}
+          NPM_CONFIG_INCLUDE: optional
+          NPM_CONFIG_IGNORE_SCRIPTS: "false"
+        run: npm run smoke:package -- --target ${{ matrix.target }}
+
+      - name: Upload native package tarball
+        uses: actions/upload-artifact@v6
+        with:
+          name: archiva-${{ matrix.target }}-npm
+          path: target/npm-tarballs/jalkarna-archiva-${{ matrix.target }}-*.tgz
+
   test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
           cache: npm
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.96.0
 
       - name: Install
         run: npm ci
@@ -24,8 +124,17 @@ jobs:
       - name: Typecheck
         run: npm run check
 
+      - name: Build
+        run: npm run build
+
       - name: Test
         run: npm test
 
-      - name: Build
-        run: npm run build
+      - name: Native differential
+        run: npm run differential:release
+
+      - name: Native stress
+        run: npm run stress:rust-port
+
+      - name: Package smoke test
+        run: npm run smoke:package
