@@ -485,7 +485,7 @@ mod tests {
         let root = unique_temp_dir("archiva-cli-help");
         let version = run_cli(&["--version".to_string()], "", &root);
         assert_eq!(version.status, 0);
-        assert_eq!(version.stdout, "0.2.0\n");
+        assert_eq!(version.stdout, concat!(env!("CARGO_PKG_VERSION"), "\n"));
         assert_eq!(version.stderr, "");
 
         let help = run_cli(&["--help".to_string()], "", &root);
