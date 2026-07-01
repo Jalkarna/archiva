@@ -204,6 +204,24 @@ ARCHIVA_FILE=src/auth/session.ts archiva hooks post-tool-use
 archiva hooks post-tool-use src/auth/session.ts
 ```
 
+Under Claude Code the `post-tool-use` hook is installed with no arguments and
+receives the tool payload as JSON on stdin; Archiva reads `tool_input.file_path`
+from it and re-anchors that file automatically. Payloads for non-file tools, or
+files outside the project, are a clean no-op so the hook never disrupts the
+agent.
+
+### Diagnostics
+
+Archiva is silent by default. To trace automatic recovery (corrupt-file skips,
+`.dmap` repair, stale-lock takeover, git-baseline fallback), raise the log level
+— diagnostics always go to stderr, never stdout, so they never corrupt command
+output or the MCP JSON-RPC stream:
+
+```sh
+archiva --verbose status          # most verbose (trace)
+ARCHIVA_LOG=warn archiva status   # error | warn | info | debug | trace
+```
+
 ## MCP configuration
 
 For MCP-capable tools that accept stdio servers:
@@ -286,7 +304,15 @@ Reads decision memory before editing:
 }
 ```
 
-Omit `anchor` to get all decisions for the file.
+Omit `anchor` to get all decisions for the file. Pass `line` (a positive
+integer) instead of `anchor` to look up the decision covering that line:
+
+```json
+{
+  "file": "src/auth/session.ts",
+  "line": 47
+}
+```
 
 ### `ghost_check`
 

@@ -60,7 +60,7 @@ fn run_cli_result(args: &[String], stdin: &str, project_root: &Path) -> Result<S
         "init" => run_init(&args[1..], project_root),
         "why" => run_why(&args[1..], project_root),
         "history" => run_history(&args[1..], project_root),
-        "hooks" => run_hooks(&args[1..], project_root),
+        "hooks" => run_hooks(&args[1..], stdin, project_root),
         "write-decision" => run_write_decision(&args[1..], stdin, project_root),
         "status" => run_status(&args[1..], project_root),
         "lint" => unreachable!("lint is handled before run_cli_result"),
@@ -185,7 +185,7 @@ fn run_history(args: &[String], project_root: &Path) -> Result<String> {
     ))
 }
 
-fn run_hooks(args: &[String], project_root: &Path) -> Result<String> {
+fn run_hooks(args: &[String], stdin: &str, project_root: &Path) -> Result<String> {
     let Some(command) = args.first().map(String::as_str) else {
         return Ok(hooks_help());
     };
@@ -223,7 +223,7 @@ fn run_hooks(args: &[String], project_root: &Path) -> Result<String> {
             }
             Ok(format!("{}\n", project::session_start(project_root)?))
         }
-        "post-tool-use" => run_post_tool_use(&args[1..], project_root),
+        "post-tool-use" => run_post_tool_use(&args[1..], stdin, project_root),
         value => Err(ArchivaError::cli(format!(
             "error: unknown command '{}'",
             value
@@ -231,31 +231,129 @@ fn run_hooks(args: &[String], project_root: &Path) -> Result<String> {
     }
 }
 
-fn run_post_tool_use(args: &[String], project_root: &Path) -> Result<String> {
-    let Some(args) = parse_positional_args(args)? else {
+fn run_post_tool_use(args: &[String], stdin: &str, project_root: &Path) -> Result<String> {
+    let Some(positionals) = parse_positional_args(args)? else {
         return Ok(post_tool_use_help());
     };
-    if args.len() > 1 {
+    if positionals.len() > 1 {
         return Err(ArchivaError::cli(format!(
             "error: unexpected argument '{}'",
-            args[1]
+            positionals[1]
         )));
     }
-    let target = args
-        .first()
+
+    // Resolution order:
+    //   1. An explicit positional file path (manual CLI / tests).
+    //   2. The Claude Code PostToolUse hook payload on stdin (the documented
+    //      automation path: the installed hook command takes no arguments and
+    //      delivers `tool_input.file_path` as JSON on stdin).
+    //   3. The ARCHIVA_FILE environment variable (legacy escape hatch).
+    if let Some(target) = positionals.first().filter(|value| !value.is_empty()) {
+        let file = RelativePath::new(target)?;
+        return Ok(format!(
+            "{}\n",
+            project::post_tool_use(project_root, &file)?
+        ));
+    }
+
+    let trimmed = stdin.trim();
+    if !trimmed.is_empty() {
+        // The hook fires after *every* tool call, most of which (Bash, Grep,
+        // Read, ...) edit no tracked source. A payload we can't turn into a
+        // repo-relative source path — missing/empty file_path, a path outside
+        // the project, or even a malformed payload — must be a clean no-op so
+        // the hook never disrupts the agent's tool flow.
+        return match hook_payload_file_path(trimmed, project_root) {
+            Some(file) => Ok(format!(
+                "{}\n",
+                project::post_tool_use(project_root, &file)?
+            )),
+            None => Ok("No source file to re-anchor from hook payload.\n".to_string()),
+        };
+    }
+
+    let target = env::var("ARCHIVA_FILE")
+        .ok()
         .filter(|value| !value.is_empty())
-        .map(|value| (*value).to_string())
-        .or_else(|| {
-            env::var("ARCHIVA_FILE")
-                .ok()
-                .filter(|value| !value.is_empty())
-        })
-        .ok_or_else(|| ArchivaError::cli("Missing file path. Pass one or set ARCHIVA_FILE."))?;
+        .ok_or_else(|| {
+            ArchivaError::cli(
+                "Missing file path. Pass one, pipe a Claude Code hook payload on stdin, or set ARCHIVA_FILE.",
+            )
+        })?;
     let file = RelativePath::new(&target)?;
     Ok(format!(
         "{}\n",
         project::post_tool_use(project_root, &file)?
     ))
+}
+
+/// Extract the edited source file from a Claude Code PostToolUse hook payload
+/// and resolve it to a repo-relative path. Returns `None` for any payload that
+/// does not correspond to a re-anchorable source file in this project (parse
+/// failure, no `tool_input.file_path`, or a path outside the project root) so
+/// callers can treat it as a benign no-op.
+fn hook_payload_file_path(stdin: &str, project_root: &Path) -> Option<RelativePath> {
+    use crate::core::json::{self, JsonValue};
+
+    let JsonValue::Object(payload) = json::parse(stdin).ok()? else {
+        return None;
+    };
+    let Some(JsonValue::Object(tool_input)) = payload.get("tool_input") else {
+        return None;
+    };
+    let Some(JsonValue::String(file_path)) = tool_input.get("file_path") else {
+        return None;
+    };
+    if file_path.is_empty() {
+        return None;
+    }
+
+    resolve_repo_relative(file_path, &payload, project_root)
+}
+
+/// Turn a (possibly absolute) hook-supplied path into a project-relative path.
+/// Absolute paths are stripped against the project root (canonicalized as a
+/// fallback) and the payload's `cwd`. Returns `None` when the file lies outside
+/// the project or the resulting path is rejected by `RelativePath`.
+fn resolve_repo_relative(
+    file_path: &str,
+    payload: &crate::core::json::JsonObject,
+    project_root: &Path,
+) -> Option<RelativePath> {
+    use crate::core::json::JsonValue;
+    use std::path::{Path, PathBuf};
+
+    let path = Path::new(file_path);
+    let relative: PathBuf = if path.is_absolute() {
+        let mut bases: Vec<PathBuf> = vec![project_root.to_path_buf()];
+        if let Ok(canonical) = project_root.canonicalize() {
+            bases.push(canonical);
+        }
+        if let Some(JsonValue::String(cwd)) = payload.get("cwd") {
+            if !cwd.is_empty() {
+                bases.push(PathBuf::from(cwd));
+            }
+        }
+        let canonical_file = path.canonicalize();
+        bases.iter().find_map(|base| {
+            path.strip_prefix(base)
+                .ok()
+                .or_else(|| {
+                    canonical_file
+                        .as_ref()
+                        .ok()
+                        .and_then(|file| file.strip_prefix(base).ok())
+                })
+                .map(Path::to_path_buf)
+        })?
+    } else {
+        path.to_path_buf()
+    };
+
+    // RelativePath::new normalizes separators, `./`, and rejects escapes; on
+    // Unix `to_str()` is already forward-slashed, on Windows it normalizes the
+    // backslashes.
+    RelativePath::new(relative.to_str()?).ok()
 }
 
 fn parse_positional_args(args: &[String]) -> Result<Option<Vec<&String>>> {
@@ -428,7 +526,7 @@ fn read_to_string_with_limit(reader: impl Read, max_bytes: usize) -> Result<Stri
 }
 
 fn main_help() -> String {
-    "Usage: archiva [options] [command]\n\nDecision layer for agentic codebases.\n\nOptions:\n  -V, --version              output the version number\n  -h, --help                 display help for command\n\nCommands:\n  init [options]             Set up Archiva in the current project\n  status                     Show decision health across the repo\n  why <file> [lineOrAnchor]  Explain why code was written\n  history <file> <anchor>    Show the decision history chain for an anchor\n  lint [options]             Run decision lint rules\n  hooks                      Run Archiva hook commands\n  mcp                        Start the Archiva MCP server over stdio\n  write-decision [options]   Record a decision from JSON on stdin or --json\n  help [command]             display help for command\n".to_string()
+    "Usage: archiva [options] [command]\n\nDecision layer for agentic codebases.\n\nOptions:\n  -V, --version              output the version number\n  -v, --verbose              enable diagnostic logging to stderr\n  -h, --help                 display help for command\n\nCommands:\n  init [options]             Set up Archiva in the current project\n  status                     Show decision health across the repo\n  why <file> [lineOrAnchor]  Explain why code was written\n  history <file> <anchor>    Show the decision history chain for an anchor\n  lint [options]             Run decision lint rules\n  hooks                      Run Archiva hook commands\n  mcp                        Start the Archiva MCP server over stdio\n  write-decision [options]   Record a decision from JSON on stdin or --json\n  help [command]             display help for command\n".to_string()
 }
 
 fn hooks_help() -> String {
@@ -872,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_dlog_fails_without_rewriting_or_leaving_locks() {
+    fn malformed_dlog_is_skipped_and_reported_without_rewriting_or_leaving_locks() {
         let root = unique_temp_dir("archiva-cli-malformed-dlog");
         let file = RelativePath::new("src/bad.ts").unwrap();
         let source_path = root.join("src").join("bad.ts");
@@ -887,11 +985,19 @@ mod tests {
         assert_eq!(why.status, 1);
         assert_eq!(why.stdout, "");
         assert!(why.stderr.contains("schema"));
+        // B5: single-file errors now name the corrupt file.
+        assert!(why.stderr.contains("bad.ts.dlog"), "{}", why.stderr);
 
+        // B5: whole-repo lint skips-and-reports the corrupt file as an
+        // error-severity issue (naming the file) instead of aborting with an
+        // empty stdout. Exit code stays non-zero because it is an error issue.
         let lint = run_cli(&["lint".to_string()], "", &root);
         assert_eq!(lint.status, 1);
-        assert_eq!(lint.stdout, "");
-        assert!(lint.stderr.contains("schema"));
+        assert_eq!(lint.stderr, "");
+        assert!(lint.stdout.contains("arc/corrupt"), "{}", lint.stdout);
+        assert!(lint.stdout.contains("src/bad.ts"), "{}", lint.stdout);
+        // The corrupt file is left untouched by lint.
+        assert_eq!(fs::read_to_string(&dlog_path).unwrap(), malformed);
 
         let write = run_cli(
             &[
@@ -915,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn session_start_corrupt_later_dlog_fails_without_partial_stdout() {
+    fn session_start_skips_and_reports_corrupt_later_dlog() {
         let root = unique_temp_dir("archiva-cli-session-corrupt-dlog");
         let source_path = root.join("src").join("a.ts");
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -947,9 +1053,21 @@ mod tests {
             "",
             &root,
         );
-        assert_eq!(session.status, 1);
-        assert_eq!(session.stdout, "");
-        assert!(session.stderr.contains("schema"));
+        // B5: session-start skips-and-reports the corrupt file (naming it)
+        // instead of aborting. It still exits 0 and reports the healthy dlog.
+        assert_eq!(session.status, 0);
+        assert_eq!(session.stderr, "");
+        assert!(session.stdout.contains("fn:good"), "{}", session.stdout);
+        assert!(
+            session.stdout.contains("could not be parsed"),
+            "{}",
+            session.stdout
+        );
+        assert!(
+            session.stdout.contains("src/z-bad.ts"),
+            "{}",
+            session.stdout
+        );
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,6 +1,7 @@
 pub mod anchor;
 pub mod decision;
 pub mod decision_status;
+pub mod diagnostics;
 pub mod diff;
 pub mod dlog;
 pub mod dmap;

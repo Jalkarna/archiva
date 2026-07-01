@@ -4,8 +4,9 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::core::anchor::{assert_anchor_exists, extract_anchors, AnchorExtraction, AnchorKind};
 use crate::core::decision::{
-    append_session_report_file, finish_session_report, history_from_dlog, start_session_report,
-    why_for_line_from_dlog, why_from_dlog, WriteDecisionInput,
+    append_session_report_corrupt, append_session_report_file, finish_session_report,
+    history_from_dlog, start_session_report, why_for_line_from_dlog, why_from_dlog,
+    WriteDecisionInput,
 };
 use crate::core::decision_status::{
     clear_recovered_status, is_fingerprint_stale, mark_orphan, mark_stale_now,
@@ -51,6 +52,46 @@ pub fn history(project_root: &Path, file: &RelativePath, anchor: &str) -> Result
     Ok(history_from_dlog(dlog.as_ref(), file, anchor))
 }
 
+/// Load a dlog for a whole-repo command, converting a corrupt-data failure into
+/// a skip: the error is recorded in `corrupt` (file + message) and `Ok(None)`
+/// is returned so the command continues over the rest of the repo instead of
+/// aborting on one bad file (audit blocker B5). Genuine IO errors still
+/// propagate — those usually indicate a systemic problem, not one bad file.
+fn load_dlog_skipping_corrupt(
+    project_root: &Path,
+    file: &RelativePath,
+    corrupt: &mut Vec<(RelativePath, String)>,
+) -> Result<Option<DlogFile>> {
+    match load_dlog(project_root, file) {
+        Ok(dlog) => Ok(dlog),
+        Err(error) if error.is_corrupt_data() => {
+            crate::diag!(
+                crate::core::diagnostics::Level::Warn,
+                "skipping corrupt decision log for {}: {}",
+                file.as_str(),
+                error.user_message()
+            );
+            corrupt.push((file.clone(), error.user_message()));
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// A lint issue standing in for a `.dlog` that could not be parsed. Surfacing
+/// corruption as an error-severity issue lets `lint`/`status` report the bad
+/// file (and exit non-zero) without aborting the whole run.
+fn corrupt_lint_issue(file: &RelativePath, message: &str) -> LintIssue {
+    LintIssue {
+        rule: LintRule::Corrupt,
+        severity: LintSeverity::Error,
+        file: file.clone(),
+        anchor: "file".to_string(),
+        message: format!("decision log could not be parsed: {message}"),
+        fixable: false,
+    }
+}
+
 pub fn list_dlog_files(project_root: &Path) -> Result<Vec<PathBuf>> {
     list_storage_files(&project_root.join(".decisions"), |path| {
         path.file_name()
@@ -73,13 +114,18 @@ pub fn session_start(project_root: &Path) -> Result<String> {
     }
 
     let mut output = start_session_report(dlog_files.len());
+    let mut corrupt = Vec::new();
     for dlog_file in &dlog_files {
         let file = decision_file_to_source(project_root, dlog_file)?;
-        if let Some(dlog) = load_dlog(project_root, &file)? {
+        // Skip corrupt files so a session still starts and reports the healthy
+        // decisions rather than aborting on one bad .dlog (audit blocker B5).
+        if let Some(dlog) = load_dlog_skipping_corrupt(project_root, &file, &mut corrupt)? {
             ensure_dmap_current(project_root, &dlog, "session-start")?;
             append_session_report_file(&mut output, &file, &dlog);
         }
     }
+    // Name the skipped files at the end of the report.
+    append_session_report_corrupt(&mut output, &corrupt);
 
     Ok(finish_session_report(output))
 }
@@ -132,7 +178,21 @@ fn lint_project_inner(
 
     for dlog_file in dlog_files {
         let file = decision_file_to_source(project_root, &dlog_file)?;
-        let Some((dlog, dlog_issues)) = lint_dlog_locked(project_root, &file, fix)? else {
+        let locked = match lint_dlog_locked(project_root, &file, fix) {
+            Ok(locked) => locked,
+            // Skip-and-report a corrupt .dlog instead of aborting the whole
+            // command; it surfaces as an error-severity lint issue naming the
+            // file (audit blocker B5).
+            Err(error) if error.is_corrupt_data() => {
+                issue_count += 1;
+                if collect_issues {
+                    issues.push(corrupt_lint_issue(&file, &error.user_message()));
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some((dlog, dlog_issues)) = locked else {
             continue;
         };
         issue_count += dlog_issues.len();
@@ -269,9 +329,18 @@ pub fn post_tool_use(project_root: &Path, file: &RelativePath) -> Result<String>
     };
     let extraction = extraction.unwrap_or_else(|| extract_anchors(file, &new_content));
     let old_git_file = moved_from.as_ref().unwrap_or(file);
-    let old_content =
-        read_git_head_file(project_root, old_git_file).unwrap_or_else(|_| new_content.clone());
-    let using_current_content_fallback = old_content == new_content;
+    let old_content = read_git_head_file(project_root, old_git_file).unwrap_or_else(|error| {
+        // No committed baseline to diff against (no git, untracked file, shallow
+        // clone, ...). We fall back to treating the current content as the
+        // baseline (empty diff); previously this was silent (audit blocker B9).
+        crate::diag!(
+            crate::core::diagnostics::Level::Debug,
+            "no git HEAD baseline for {} ({}); using current content as the diff baseline",
+            old_git_file.as_str(),
+            error.user_message()
+        );
+        new_content.clone()
+    });
     let line_changes = diff_lines(&old_content, &new_content);
 
     let lock_timestamp = now_utc_millis()
@@ -285,21 +354,31 @@ pub fn post_tool_use(project_root: &Path, file: &RelativePath) -> Result<String>
             let mut stale = 0_usize;
             let mut orphan = 0_usize;
             for (anchor, decision) in dlog.decisions.iter_mut() {
-                let shifted_range =
-                    apply_line_changes_to_range(&line_changes, decision.lines_hint.clone());
                 let anchor_exists = if let Some(info) = extraction.anchors.get_str(anchor) {
-                    decision.lines_hint = if moved_from.is_some() && using_current_content_fallback
-                    {
-                        LineRange {
-                            start: info.start,
-                            end: info.end,
-                        }
-                    } else {
-                        shifted_range
+                    // The anchor still resolves in the freshly-extracted source,
+                    // so the extractor's live position is ground truth. Use it
+                    // directly to keep re-anchoring idempotent: a second run
+                    // re-derives the same range and leaves lines_hint/STALE
+                    // unchanged. Diff-shifting a still-resolving anchor (the old
+                    // behavior) drifts the range across repeated edits and marks
+                    // moved-but-unchanged code falsely STALE.
+                    //
+                    // The fingerprint is intentionally NOT recomputed here: it is
+                    // the staleness oracle (content hash captured at decision
+                    // time). is_fingerprint_stale compares the source at this
+                    // corrected position against that stored hash, so a semantic
+                    // change is still detected while a pure line shift is not.
+                    decision.lines_hint = LineRange {
+                        start: info.start,
+                        end: info.end,
                     };
                     true
                 } else {
-                    decision.lines_hint = shifted_range;
+                    // Orphaned anchor: it no longer resolves, so there is no
+                    // ground-truth position. Fall back to diff-shifting the old
+                    // range as a best-effort approximation of where it moved.
+                    decision.lines_hint =
+                        apply_line_changes_to_range(&line_changes, decision.lines_hint.clone());
                     false
                 };
 
@@ -399,9 +478,13 @@ fn moved_dlog_matches_new_source(
 fn load_project_status_summaries(project_root: &Path) -> Result<Vec<StatusFileSummary>> {
     let dlog_files = list_dlog_files(project_root)?;
     let mut summaries = Vec::new();
+    let mut corrupt = Vec::new();
     for dlog_file in dlog_files {
         let file = decision_file_to_source(project_root, &dlog_file)?;
-        if let Some(dlog) = load_dlog(project_root, &file)? {
+        // Skip corrupt files so status renders the healthy ones; the corrupt
+        // count is reflected via the separate lint issue count in `status`
+        // (audit blocker B5).
+        if let Some(dlog) = load_dlog_skipping_corrupt(project_root, &file, &mut corrupt)? {
             ensure_dmap_current(project_root, &dlog, "status")?;
             summaries.push(status_summary_from_dlog(&dlog));
         }
@@ -1629,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn post_tool_use_keeps_stored_range_without_git_baseline() {
+    fn post_tool_use_reanchors_to_live_position_without_git_baseline() {
         let root = unique_temp_dir("archiva-project-post-shift-no-git");
         let source_path = root.join("src").join("shift.ts");
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -1650,24 +1733,40 @@ mod tests {
         .unwrap();
         let file = RelativePath::new("src/shift.ts").unwrap();
 
+        // A comment was inserted above the function: its body is byte-identical
+        // but it now lives at lines 2-4. Even without a git baseline to diff
+        // against, the extractor resolves fn:kept at its live position, so we
+        // re-anchor there. The fingerprint at the corrected range matches the
+        // stored hash, so the unchanged function is NOT falsely marked STALE.
         assert_eq!(
             post_tool_use(&root, &file).unwrap(),
-            "Re-anchored src/shift.ts: 1 stale, 0 orphan."
+            "Re-anchored src/shift.ts: 0 stale, 0 orphan."
         );
         let stored = load_dlog(&root, &file).unwrap().unwrap();
         let decision = stored.decisions.get_str("fn:kept").unwrap();
-        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 3 });
-        assert_eq!(decision.status, Some(DecisionStatus::Stale));
+        assert_eq!(decision.lines_hint, LineRange { start: 2, end: 4 });
+        assert_eq!(decision.status, None);
         assert_eq!(
             fs::read_to_string(dmap_path(&root, &file)).unwrap(),
-            "1-3:fn:kept:STALE\n"
+            "2-4:fn:kept\n"
         );
+
+        // Re-anchoring is idempotent: a second run leaves range and status
+        // unchanged.
+        assert_eq!(
+            post_tool_use(&root, &file).unwrap(),
+            "Re-anchored src/shift.ts: 0 stale, 0 orphan."
+        );
+        let stored_again = load_dlog(&root, &file).unwrap().unwrap();
+        let decision_again = stored_again.decisions.get_str("fn:kept").unwrap();
+        assert_eq!(decision_again.lines_hint, LineRange { start: 2, end: 4 });
+        assert_eq!(decision_again.status, None);
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn post_tool_use_preserves_stored_range_when_anchor_body_grows() {
+    fn post_tool_use_reanchors_to_live_range_when_anchor_body_grows() {
         let root = unique_temp_dir("archiva-project-post-range-growth");
         let source_path = root.join("src").join("growth.ts");
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -1688,18 +1787,70 @@ mod tests {
         .unwrap();
         let file = RelativePath::new("src/growth.ts").unwrap();
 
+        // The body genuinely changed and grew to lines 1-4. We re-anchor to the
+        // live range 1-4, and because the content at that range differs from the
+        // stored fingerprint it is correctly marked STALE.
         assert_eq!(
             post_tool_use(&root, &file).unwrap(),
             "Re-anchored src/growth.ts: 1 stale, 0 orphan."
         );
         let stored = load_dlog(&root, &file).unwrap().unwrap();
         let decision = stored.decisions.get_str("fn:kept").unwrap();
-        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 3 });
+        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 4 });
         assert_eq!(decision.status, Some(DecisionStatus::Stale));
         assert_eq!(
             fs::read_to_string(dmap_path(&root, &file)).unwrap(),
-            "1-3:fn:kept:STALE\n"
+            "1-4:fn:kept:STALE\n"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_decision_snaps_range_to_anchor_span_and_avoids_false_stale() {
+        // Regression for the false-STALE bug: a caller records a range that
+        // differs from the anchor's extractor span (here a body-only [2, 3]
+        // where fn:kept spans 1-3). The old write path stored `input.lines`
+        // verbatim and fingerprinted that range, but `post_tool_use` re-anchors
+        // to the extractor span [1, 3] — so the first re-anchor of *unchanged*
+        // code recomputed the fingerprint over a different range and falsely
+        // marked the decision STALE, then lint demanded a supersede.
+        let root = unique_temp_dir("archiva-project-false-stale");
+        let source_path = root.join("src").join("k.ts");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(
+            &source_path,
+            "function kept() {\n  return 1;\n}\nconst x = 1;\n",
+        )
+        .unwrap();
+
+        let mut input = write_input("src/k.ts", "fn:kept", None);
+        input.lines = LineRange { start: 2, end: 3 }; // body-only, != span 1-3
+        let record = write_decision_with_context(
+            &root,
+            &input,
+            "2026-06-26T20:31:18.340Z",
+            None,
+            "2026-06-26T20:31:18.341Z",
+        )
+        .unwrap();
+        // Write time already snaps to the extractor span for both fields.
+        assert_eq!(record.lines_hint, LineRange { start: 1, end: 3 });
+
+        let file = RelativePath::new("src/k.ts").unwrap();
+        // Re-anchoring unchanged code must report 0 stale, twice (idempotent).
+        assert_eq!(
+            post_tool_use(&root, &file).unwrap(),
+            "Re-anchored src/k.ts: 0 stale, 0 orphan."
+        );
+        assert_eq!(
+            post_tool_use(&root, &file).unwrap(),
+            "Re-anchored src/k.ts: 0 stale, 0 orphan."
+        );
+        let stored = load_dlog(&root, &file).unwrap().unwrap();
+        let decision = stored.decisions.get_str("fn:kept").unwrap();
+        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 3 });
+        assert_eq!(decision.status, None);
 
         let _ = fs::remove_dir_all(root);
     }

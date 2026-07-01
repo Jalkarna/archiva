@@ -59,6 +59,59 @@ pub fn render_dlog_yaml(dlog: &DlogFile) -> Result<String> {
     Ok(render_yaml(&dlog_to_yaml(dlog)))
 }
 
+/// Validate the domain invariants a `.dlog` must satisfy before it is written,
+/// checked directly on the struct. This replaces the former render→re-parse
+/// round-trip on the write hot path (audit blocker B8): re-parsing freshly
+/// rendered YAML was O(file) wasted work per write, but the parser enforced
+/// invariants an in-memory struct could still violate, so those are re-checked
+/// here cheaply. It mirrors `parse_decision_record`: non-empty required
+/// strings, a positive two-line range, and non-empty nested entries — so a
+/// write can never persist a `.dlog` that its own reader would reject.
+pub fn validate_dlog_for_write(dlog: &DlogFile) -> Result<()> {
+    if dlog.schema != DLOG_SCHEMA_VERSION {
+        return Err(ArchivaError::schema(
+            "schema",
+            format!("expected schema version {DLOG_SCHEMA_VERSION}"),
+        ));
+    }
+    for (anchor, decision) in dlog.decisions.iter() {
+        let field = |name: &str| format!("decisions.{anchor}.{name}");
+        require_non_empty(&decision.id, &field("id"))?;
+        require_non_empty(&decision.fingerprint, &field("fingerprint"))?;
+        require_non_empty(&decision.chose, &field("chose"))?;
+        require_non_empty(&decision.because, &field("because"))?;
+        require_non_empty(&decision.timestamp, &field("timestamp"))?;
+        if decision.lines_hint.start == 0 || decision.lines_hint.end == 0 {
+            return Err(ArchivaError::schema(
+                field("lines_hint"),
+                "expected two positive integers",
+            ));
+        }
+        for (index, rejected) in decision.rejected.iter().enumerate() {
+            require_non_empty(
+                &rejected.approach,
+                &field(&format!("rejected.{index}.approach")),
+            )?;
+            require_non_empty(
+                &rejected.reason,
+                &field(&format!("rejected.{index}.reason")),
+            )?;
+        }
+        for (index, entry) in decision.history.iter().enumerate() {
+            require_non_empty(&entry.id, &field(&format!("history.{index}.id")))?;
+            require_non_empty(&entry.chose, &field(&format!("history.{index}.chose")))?;
+        }
+    }
+    Ok(())
+}
+
+fn require_non_empty(value: &str, field: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(ArchivaError::schema(field, "expected non-empty string"));
+    }
+    Ok(())
+}
+
 fn parse_dlog_value(value: &YamlValue) -> Result<DlogFile> {
     let object = expect_object(value, "")?;
     let file = expect_string(required(object, "file", "file")?, "file")?;

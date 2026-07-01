@@ -515,7 +515,16 @@ fn stale_recovery_lock_path(lock_path: &Path) -> PathBuf {
 
 fn remove_stale_lock(lock_path: &Path) -> Result<bool> {
     match fs::remove_file(lock_path) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            // Silent stale-lock takeover was previously invisible (audit
+            // blocker B9); surface it on the diagnostic channel.
+            crate::diag!(
+                crate::core::diagnostics::Level::Info,
+                "recovered stale lock {}",
+                lock_path.display()
+            );
+            Ok(true)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(source) => Err(ArchivaError::io(
             Some(lock_path.to_path_buf()),

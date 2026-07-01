@@ -462,6 +462,8 @@ async function runCorpusScale(
       );
     }
   }, phaseRss);
+  const writtenDecisionFiles = await readWrittenCorpusDecisions(root, decisionFiles);
+  const writtenMutatedFiles = writtenDecisionFiles.slice(0, mutatedFiles.length);
 
   await measure(phases, "mutate", async () => {
     for (let index = 0; index < mutatedFiles.length; index += 1) {
@@ -494,7 +496,12 @@ async function runCorpusScale(
     commandOutputs.why = result.stdout;
     commandSummaries.why = summarize(result);
   }, phaseRss);
-  const semanticSummary = await verifyCorpusScaleArtifacts(root, decisionFiles, mutatedFiles, commandOutputs);
+  const semanticSummary = await verifyCorpusScaleArtifacts(
+    root,
+    writtenDecisionFiles,
+    writtenMutatedFiles,
+    commandOutputs
+  );
 
   return {
     root,
@@ -505,6 +512,20 @@ async function runCorpusScale(
     semanticSummary,
     parityArtifacts: includeParityArtifacts ? await readDecisionArtifacts(root, decisionFiles) : undefined
   };
+}
+
+async function readWrittenCorpusDecisions(root: string, decisions: CorpusDecision[]): Promise<CorpusDecision[]> {
+  const written: CorpusDecision[] = [];
+  for (const decision of decisions) {
+    const dmapPath = path.join(root, `.decisions/${decision.file}.dmap`);
+    const dmap = await fs.readFile(dmapPath, "utf8");
+    const dmapEntry = parseCorpusDmapEntry(dmap.trimEnd(), decision);
+    written.push({
+      ...decision,
+      lines: [dmapEntry.start, dmapEntry.end]
+    });
+  }
+  return written;
 }
 
 async function verifyCorpusScaleArtifacts(

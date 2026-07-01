@@ -6,6 +6,23 @@ use crate::core::error::{ArchivaError, Result};
 use crate::core::ordered_map::OrderedMap;
 use crate::core::paths::RelativePath;
 
+/// Maximum nesting depth the recursive Rust extractor will descend before it
+/// stops and marks the extraction truncated. Measured frame cost is ~600 B, so
+/// 256 levels (~150 KiB) is safe even on a 1 MiB main-thread stack (Windows)
+/// while being far above any plausible hand-written source nesting.
+const MAX_RUST_NESTING_DEPTH: usize = 256;
+
+/// Maximum nesting depth the recursive JavaScript/TypeScript/C-family scanners
+/// (template-literal interpolation, `if`/`else` statement bodies, and the
+/// complexity estimator) will descend before they stop and report the
+/// extraction incomplete. Like [`MAX_RUST_NESTING_DEPTH`], this bounds an
+/// otherwise-unbounded mutual recursion whose overflow is an uncatchable
+/// *abort* (deeply nested `` `${`${…}`}` `` or `else if` chains in a committed
+/// source file would take down `status`/`lint` and the long-lived MCP server).
+/// The bound is far above any plausible hand-written nesting yet safe even on a
+/// 1 MiB main-thread stack.
+const MAX_SOURCE_NESTING_DEPTH: usize = 256;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnchorKind {
     Function,
@@ -283,6 +300,7 @@ pub fn extract_anchors(file: &RelativePath, source: &str) -> AnchorExtraction {
     let parens = matching_tokens(tokens, "(", ")");
     let braces = matching_tokens(tokens, "{", "}");
     let brackets = matching_tokens(tokens, "[", "]");
+    let brace_prefix = brace_depth_prefix_sums(tokens);
     collect_delimiter_diagnostics(source, tokens, &parens, "(", ")", &mut diagnostics);
     collect_delimiter_diagnostics(source, tokens, &braces, "{", "}", &mut diagnostics);
     collect_delimiter_diagnostics(source, tokens, &brackets, "[", "]", &mut diagnostics);
@@ -293,6 +311,7 @@ pub fn extract_anchors(file: &RelativePath, source: &str) -> AnchorExtraction {
     collect_function_anchors(
         source,
         tokens,
+        &brace_prefix,
         &parens,
         &braces,
         &mut builder,
@@ -302,16 +321,18 @@ pub fn extract_anchors(file: &RelativePath, source: &str) -> AnchorExtraction {
     collect_class_anchors(
         source,
         tokens,
+        &brace_prefix,
         &parens,
         &braces,
         &mut builder,
         &mut exports,
         &mut declarations,
     );
-    collect_default_export_anchors(tokens, &parens, &braces, &mut exports);
+    collect_default_export_anchors(tokens, &brace_prefix, &parens, &braces, &mut exports);
     collect_variable_anchors(
         source,
         tokens,
+        &brace_prefix,
         &parens,
         &braces,
         malformed_jsx_arrow,
@@ -319,11 +340,24 @@ pub fn extract_anchors(file: &RelativePath, source: &str) -> AnchorExtraction {
         &mut exports,
         &mut declarations,
     );
-    collect_type_like_export_anchors(tokens, &braces, &mut exports, &mut declarations);
-    collect_import_equals_declarations(tokens, &mut declarations);
-    collect_export_alias_anchors(tokens, &declarations, &mut exports);
-    collect_export_import_anchors(tokens, &mut exports);
-    collect_export_assignment_namespace_anchors(source, tokens, &parens, &braces, &mut exports);
+    collect_type_like_export_anchors(
+        tokens,
+        &brace_prefix,
+        &braces,
+        &mut exports,
+        &mut declarations,
+    );
+    collect_import_equals_declarations(tokens, &brace_prefix, &mut declarations);
+    collect_export_alias_anchors(tokens, &brace_prefix, &declarations, &mut exports);
+    collect_export_import_anchors(tokens, &brace_prefix, &mut exports);
+    collect_export_assignment_namespace_anchors(
+        source,
+        tokens,
+        &brace_prefix,
+        &parens,
+        &braces,
+        &mut exports,
+    );
     collect_export_anchors(&mut builder, exports);
     let mut blocks = Vec::new();
     collect_if_block_candidates(source, tokens, &parens, &braces, 0, 0, &mut blocks);
@@ -375,6 +409,25 @@ pub fn assert_anchor_exists(file: &RelativePath, source: &str, anchor: &str) -> 
 struct AnchorBuilder {
     anchors: OrderedMap<String, AnchorInfo>,
     counts: HashMap<String, u32>,
+    /// Set when recursive extraction stopped descending because it hit the
+    /// nesting-depth bound (see `MAX_RUST_NESTING_DEPTH`). The caller turns this
+    /// into a diagnostic so the extraction is reported as incomplete rather than
+    /// silently dropping the over-deep anchors.
+    truncated: bool,
+    /// Current recursion depth of `collect_rust_item_anchors`, the cut-vertex
+    /// of the Rust extraction recursion graph. Tracked here instead of as a
+    /// function parameter so the bound covers every recursive cycle (blocks,
+    /// fn/method bodies, impl/trait/mod descent) without threading `depth`
+    /// through six signatures.
+    rust_item_depth: usize,
+    /// Prefix sums of `({, (, [)` delimiter depth over the Rust token stream,
+    /// length `tokens.len() + 1` (`rust_depths[i]` covers tokens `[0, i)`).
+    /// Two token positions are at the same nesting depth iff their prefix
+    /// entries are equal, which turns the direct-scope-membership test into an
+    /// O(1) comparison instead of an O(index - start) re-scan — the fix for the
+    /// O(n²) extraction blowup on declaration-dense files. Empty for non-Rust
+    /// extraction.
+    rust_depths: Vec<(i32, i32, i32)>,
 }
 
 impl AnchorBuilder {
@@ -382,6 +435,9 @@ impl AnchorBuilder {
         Self {
             anchors: OrderedMap::new(),
             counts: HashMap::new(),
+            truncated: false,
+            rust_item_depth: 0,
+            rust_depths: Vec::new(),
         }
     }
 
@@ -393,7 +449,11 @@ impl AnchorBuilder {
         } else {
             format!("{}#{}", base, seen + 1)
         };
-        self.anchors.insert(
+        // `add` is the sole inserter and the `#N` disambiguation above makes
+        // every key distinct, so we can skip `insert`'s linear duplicate scan.
+        // That scan ran once per anchor, making whole-file construction O(n²) on
+        // declaration-dense files; `push_unique` keeps it O(n).
+        self.anchors.push_unique(
             anchor.clone(),
             AnchorInfo {
                 anchor,
@@ -418,6 +478,7 @@ fn extract_rust_anchors(source: &str) -> AnchorExtraction {
     collect_delimiter_diagnostics(source, &tokens, &brackets, "[", "]", &mut diagnostics);
     let line_map = RustLineMap::new(source);
     let mut builder = AnchorBuilder::new();
+    builder.rust_depths = rust_depth_prefix_sums(&tokens);
     let mut exports = Vec::new();
     let mut blocks = Vec::new();
 
@@ -436,6 +497,19 @@ fn extract_rust_anchors(source: &str) -> AnchorExtraction {
     );
     collect_export_anchors(&mut builder, exports);
     collect_block_anchors(&mut builder, blocks);
+
+    if builder.truncated {
+        // Recursion stopped at the depth bound, so anchors below that level are
+        // missing. Surface it as an error diagnostic; this drives `complete` to
+        // false so re-anchoring treats unresolved anchors as "extraction
+        // incomplete" rather than orphaning them.
+        push_byte_diagnostic(
+            source,
+            0,
+            "Rust source nesting exceeds the supported depth limit; anchor extraction is incomplete",
+            &mut diagnostics,
+        );
+    }
 
     AnchorExtraction {
         anchors: builder.anchors,
@@ -499,6 +573,19 @@ fn collect_c_family_type_anchors(
             }
             _ => continue,
         };
+        // A `class`/`struct` keyword that belongs to a scoped enum (`enum class`
+        // / `enum struct`) was already consumed by the `enum` arm above; the
+        // loop still lands on it, so skip it here. Otherwise it would emit a
+        // phantom class:/struct: anchor at the enum's line and, when a real
+        // same-named type exists, demote the real one to a `#2` suffix so a
+        // decision anchored to the natural name binds to the phantom (F17).
+        if matches!(tokens[index].text.as_str(), "class" | "struct")
+            && tokens
+                .get(index.wrapping_sub(1))
+                .is_some_and(|token| index > 0 && token.text == "enum")
+        {
+            continue;
+        }
         if tokens
             .get(index.checked_sub(1).unwrap_or(index))
             .is_some_and(|token| token.text == ".")
@@ -649,8 +736,25 @@ fn c_family_qualified_name_before(
     if !is_identifier(&name_token.text) || c_family_keyword(&name_token.text) {
         return None;
     }
-    let mut parts = vec![c_family_anchor_name(&name_token.text)];
-    let mut start_index = name_index;
+    // A destructor's leading `~` is a separate token that was previously
+    // ignored, so `~A()` produced the name `A` — identical to the constructor
+    // `A()` (F18). Preserve it so a destructor anchors as `Class.~Class`,
+    // distinct from the constructor `Class.Class`.
+    let has_destructor_tilde = name_index
+        .checked_sub(1)
+        .and_then(|prev| tokens.get(prev))
+        .is_some_and(|token| token.text == "~");
+    let leading_name = if has_destructor_tilde {
+        format!("~{}", c_family_anchor_name(&name_token.text))
+    } else {
+        c_family_anchor_name(&name_token.text)
+    };
+    let mut parts = vec![leading_name];
+    let mut start_index = if has_destructor_tilde {
+        name_index.saturating_sub(1)
+    } else {
+        name_index
+    };
     let mut cursor = name_index;
     while cursor >= 3
         && tokens[cursor - 1].text == ":"
@@ -743,14 +847,58 @@ fn collect_rust_item_anchors(
     blocks: &mut Vec<BlockCandidate>,
     allow_exports: bool,
 ) {
+    // Bound recursion at the cut-vertex of the Rust extraction graph. Deeply
+    // nested input (e.g. thousands of `{`) would otherwise recurse once per
+    // level and overflow the stack — an *abort* that no panic boundary can
+    // catch, taking down `status`/`lint` and the long-lived MCP server. The
+    // bound is far above any realistic source nesting yet safe even on a 1 MiB
+    // main-thread stack (Windows). Hitting it marks the extraction truncated so
+    // it is reported incomplete rather than silently partial.
+    if builder.rust_item_depth >= MAX_RUST_NESTING_DEPTH {
+        builder.truncated = true;
+        return;
+    }
+    builder.rust_item_depth += 1;
+    collect_rust_item_anchors_inner(
+        source,
+        line_map,
+        tokens,
+        braces,
+        start,
+        end,
+        scope_prefix,
+        builder,
+        exports,
+        blocks,
+        allow_exports,
+    );
+    builder.rust_item_depth -= 1;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_rust_item_anchors_inner(
+    source: &str,
+    line_map: &RustLineMap<'_>,
+    tokens: &[Token],
+    braces: &[Option<usize>],
+    start: usize,
+    end: usize,
+    scope_prefix: &str,
+    builder: &mut AnchorBuilder,
+    exports: &mut Vec<ExportCandidate>,
+    blocks: &mut Vec<BlockCandidate>,
+    allow_exports: bool,
+) {
     let mut index = start;
     while index < end {
-        if !is_rust_direct_scope_member(tokens, start, index) {
+        if !is_rust_direct_scope_member(&builder.rust_depths, start, index) {
             index += 1;
             continue;
         }
         let (item_index, visibility_index) = rust_item_dispatch_index(tokens, index, end);
-        if item_index >= end || !is_rust_direct_scope_member(tokens, start, item_index) {
+        if item_index >= end
+            || !is_rust_direct_scope_member(&builder.rust_depths, start, item_index)
+        {
             index += 1;
             continue;
         }
@@ -1087,14 +1235,14 @@ fn collect_rust_impl_method_anchors(
 ) {
     let mut index = body_open + 1;
     while index < body_close {
-        if !is_rust_direct_impl_member(tokens, body_open, index) {
+        if !is_rust_direct_impl_member(&builder.rust_depths, body_open, index) {
             index += 1;
             continue;
         }
         let (item_index, visibility_index) = rust_item_dispatch_index(tokens, index, body_close);
         if item_index >= body_close
             || tokens[item_index].text != "fn"
-            || !is_rust_direct_impl_member(tokens, body_open, item_index)
+            || !is_rust_direct_impl_member(&builder.rust_depths, body_open, item_index)
         {
             index += 1;
             continue;
@@ -1187,7 +1335,9 @@ fn collect_rust_trait_method_anchors(
 ) {
     let mut index = body_open + 1;
     while index < body_close {
-        if tokens[index].text != "fn" || !is_rust_direct_item_member(tokens, body_open, index) {
+        if tokens[index].text != "fn"
+            || !is_rust_direct_item_member(&builder.rust_depths, body_open, index)
+        {
             index += 1;
             continue;
         }
@@ -1718,16 +1868,16 @@ fn rust_trait_method_end(
     None
 }
 
-fn is_rust_direct_impl_member(tokens: &[Token], body_open: usize, index: usize) -> bool {
-    is_rust_direct_item_member(tokens, body_open, index)
+fn is_rust_direct_impl_member(depths: &[(i32, i32, i32)], body_open: usize, index: usize) -> bool {
+    is_rust_direct_item_member(depths, body_open, index)
 }
 
-fn is_rust_direct_item_member(tokens: &[Token], body_open: usize, index: usize) -> bool {
-    rust_depths_before(tokens, body_open + 1, index) == (0, 0, 0)
+fn is_rust_direct_item_member(depths: &[(i32, i32, i32)], body_open: usize, index: usize) -> bool {
+    depths.get(body_open + 1) == depths.get(index)
 }
 
-fn is_rust_direct_scope_member(tokens: &[Token], start: usize, index: usize) -> bool {
-    rust_depths_before(tokens, start, index) == (0, 0, 0)
+fn is_rust_direct_scope_member(depths: &[(i32, i32, i32)], start: usize, index: usize) -> bool {
+    depths.get(start) == depths.get(index)
 }
 
 fn rust_block_can_contain_local_items(
@@ -1757,22 +1907,29 @@ fn rust_block_header_contains(
     false
 }
 
-fn rust_depths_before(tokens: &[Token], start: usize, end: usize) -> (i32, i32, i32) {
-    let mut brace_depth = 0_i32;
-    let mut paren_depth = 0_i32;
-    let mut bracket_depth = 0_i32;
-    for token in &tokens[start..end] {
+/// Cumulative `({, (, [)` delimiter-depth prefix sums over the token stream.
+/// Entry `i` is the net depth of tokens `[0, i)`, so the net depth of any range
+/// `[start, end)` is `prefix[end] - prefix[start]`, and two positions sit at the
+/// same nesting depth iff their prefix entries are equal. Computed once in a
+/// single O(n) pass; replaces the former per-call `[start..index]` re-scan that
+/// made direct-scope-membership checks O(n²) on declaration-dense files.
+fn rust_depth_prefix_sums(tokens: &[Token]) -> Vec<(i32, i32, i32)> {
+    let mut prefix = Vec::with_capacity(tokens.len() + 1);
+    let mut acc = (0_i32, 0_i32, 0_i32);
+    prefix.push(acc);
+    for token in tokens {
         match token.text.as_str() {
-            "{" => brace_depth += 1,
-            "}" => brace_depth -= 1,
-            "(" => paren_depth += 1,
-            ")" => paren_depth -= 1,
-            "[" => bracket_depth += 1,
-            "]" => bracket_depth -= 1,
+            "{" => acc.0 += 1,
+            "}" => acc.0 -= 1,
+            "(" => acc.1 += 1,
+            ")" => acc.1 -= 1,
+            "[" => acc.2 += 1,
+            "]" => acc.2 -= 1,
             _ => {}
         }
+        prefix.push(acc);
     }
-    (brace_depth, paren_depth, bracket_depth)
+    prefix
 }
 
 fn rust_complexity_between(
@@ -2228,6 +2385,7 @@ fn rust_raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
 fn collect_function_anchors(
     source: &str,
     tokens: &[Token],
+    brace_prefix: &[i32],
     parens: &[Option<usize>],
     braces: &[Option<usize>],
     builder: &mut AnchorBuilder,
@@ -2235,7 +2393,7 @@ fn collect_function_anchors(
     declarations: &mut HashMap<String, ExportCandidate>,
 ) {
     for index in 0..tokens.len() {
-        if tokens[index].text != "function" || !is_top_level(tokens, index) {
+        if tokens[index].text != "function" || !is_top_level(tokens, brace_prefix, index) {
             continue;
         }
         if is_function_expression_token(tokens, index) {
@@ -2310,6 +2468,7 @@ fn is_function_expression_token(tokens: &[Token], function_index: usize) -> bool
 fn collect_class_anchors(
     source: &str,
     tokens: &[Token],
+    brace_prefix: &[i32],
     parens: &[Option<usize>],
     braces: &[Option<usize>],
     builder: &mut AnchorBuilder,
@@ -2317,7 +2476,7 @@ fn collect_class_anchors(
     declarations: &mut HashMap<String, ExportCandidate>,
 ) {
     for index in 0..tokens.len() {
-        if tokens[index].text != "class" || !is_top_level(tokens, index) {
+        if tokens[index].text != "class" || !is_top_level(tokens, brace_prefix, index) {
             continue;
         }
         if is_class_expression_token(tokens, index) {
@@ -3021,8 +3180,11 @@ fn is_c_family_file(file: &RelativePath) -> bool {
 }
 
 fn tsx_ambiguous_generic_arrow_limit(tokens: &[Token]) -> Option<usize> {
+    let brace_prefix = brace_depth_prefix_sums(tokens);
     for index in 0..tokens.len() {
-        if !is_variable_declaration_keyword(&tokens[index].text) || !is_top_level(tokens, index) {
+        if !is_variable_declaration_keyword(&tokens[index].text)
+            || !is_top_level(tokens, &brace_prefix, index)
+        {
             continue;
         }
         let Some(eq_index) = find_next_until(tokens, index + 1, "=", &[";"]) else {
@@ -3071,8 +3233,11 @@ fn tsx_unclosed_jsx_arrow_recovery(
     tokens: &[Token],
     parens: &[Option<usize>],
 ) -> Option<TsxMalformedJsxArrowRecovery> {
+    let brace_prefix = brace_depth_prefix_sums(tokens);
     for index in 0..tokens.len() {
-        if !is_variable_declaration_keyword(&tokens[index].text) || !is_top_level(tokens, index) {
+        if !is_variable_declaration_keyword(&tokens[index].text)
+            || !is_top_level(tokens, &brace_prefix, index)
+        {
             continue;
         }
         let Some(eq_index) = find_next_until(tokens, index + 1, "=", &[",", ";"]) else {
@@ -3091,8 +3256,8 @@ fn tsx_unclosed_jsx_arrow_recovery(
         if !tsx_starts_unclosed_jsx_element(tokens, open_index) {
             continue;
         }
-        let token_limit =
-            next_top_level_declaration_after(tokens, open_index + 1).unwrap_or(tokens.len());
+        let token_limit = next_top_level_declaration_after(tokens, &brace_prefix, open_index + 1)
+            .unwrap_or(tokens.len());
         return Some(TsxMalformedJsxArrowRecovery {
             token_limit,
             eq_index,
@@ -3106,8 +3271,11 @@ fn tsx_mismatched_jsx_arrow_diagnostic(
     tokens: &[Token],
     parens: &[Option<usize>],
 ) -> Option<usize> {
+    let brace_prefix = brace_depth_prefix_sums(tokens);
     for index in 0..tokens.len() {
-        if !is_variable_declaration_keyword(&tokens[index].text) || !is_top_level(tokens, index) {
+        if !is_variable_declaration_keyword(&tokens[index].text)
+            || !is_top_level(tokens, &brace_prefix, index)
+        {
             continue;
         }
         let Some(eq_index) = find_next_until(tokens, index + 1, "=", &[",", ";"]) else {
@@ -3183,9 +3351,13 @@ fn tsx_starts_mismatched_jsx_element(tokens: &[Token], open_index: usize) -> boo
     false
 }
 
-fn next_top_level_declaration_after(tokens: &[Token], start: usize) -> Option<usize> {
+fn next_top_level_declaration_after(
+    tokens: &[Token],
+    brace_prefix: &[i32],
+    start: usize,
+) -> Option<usize> {
     for index in start..tokens.len() {
-        if is_top_level(tokens, index)
+        if is_top_level(tokens, brace_prefix, index)
             && matches!(
                 tokens[index].text.as_str(),
                 "function" | "class" | "const" | "let" | "var" | "using" | "export"
@@ -3200,6 +3372,7 @@ fn next_top_level_declaration_after(tokens: &[Token], start: usize) -> Option<us
 fn collect_variable_anchors(
     source: &str,
     tokens: &[Token],
+    brace_prefix: &[i32],
     parens: &[Option<usize>],
     braces: &[Option<usize>],
     malformed_jsx_arrow: Option<(usize, u32)>,
@@ -3209,7 +3382,9 @@ fn collect_variable_anchors(
 ) {
     let brackets = matching_tokens(tokens, "[", "]");
     for index in 0..tokens.len() {
-        if !is_variable_declaration_keyword(&tokens[index].text) || !is_top_level(tokens, index) {
+        if !is_variable_declaration_keyword(&tokens[index].text)
+            || !is_top_level(tokens, brace_prefix, index)
+        {
             continue;
         }
         if tokens[index].text == "const"
@@ -3360,6 +3535,7 @@ fn binding_pattern_declarations(
         brackets,
         pattern_open,
         pattern_close,
+        0,
         &mut bindings,
     );
     bindings
@@ -3384,8 +3560,17 @@ fn collect_variable_binding_names(
     brackets: &[Option<usize>],
     pattern_open: usize,
     pattern_close: usize,
+    depth: usize,
     bindings: &mut Vec<BindingNameCandidate>,
 ) {
+    // Cut-vertex of the destructuring-pattern recursion graph: deeply nested
+    // `{a:{a:{…}}}` / `[[[…]]]` binding patterns would otherwise recurse once
+    // per level and overflow the stack — an uncatchable abort (see
+    // `MAX_SOURCE_NESTING_DEPTH`). Stop descending past the bound; the deepest
+    // bindings simply go uncollected, which is conservative.
+    if depth >= MAX_SOURCE_NESTING_DEPTH {
+        return;
+    }
     match tokens.get(pattern_open).map(|token| token.text.as_str()) {
         Some("{") => collect_variable_object_binding_names(
             tokens,
@@ -3394,6 +3579,7 @@ fn collect_variable_binding_names(
             brackets,
             pattern_open,
             pattern_close,
+            depth,
             bindings,
         ),
         Some("[") => collect_variable_array_binding_names(
@@ -3403,6 +3589,7 @@ fn collect_variable_binding_names(
             brackets,
             pattern_open,
             pattern_close,
+            depth,
             bindings,
         ),
         _ => {}
@@ -3416,6 +3603,7 @@ fn collect_variable_object_binding_names(
     brackets: &[Option<usize>],
     pattern_open: usize,
     pattern_close: usize,
+    depth: usize,
     bindings: &mut Vec<BindingNameCandidate>,
 ) {
     let mut cursor = pattern_open + 1;
@@ -3433,6 +3621,7 @@ fn collect_variable_object_binding_names(
             brackets,
             cursor,
             element_end,
+            depth,
             bindings,
         );
         cursor = element_end + 1;
@@ -3449,6 +3638,7 @@ fn collect_variable_array_binding_names(
     brackets: &[Option<usize>],
     pattern_open: usize,
     pattern_close: usize,
+    depth: usize,
     bindings: &mut Vec<BindingNameCandidate>,
 ) {
     let mut cursor = pattern_open + 1;
@@ -3466,6 +3656,7 @@ fn collect_variable_array_binding_names(
             brackets,
             cursor,
             element_end,
+            depth,
             bindings,
         );
         cursor = element_end + 1;
@@ -3482,6 +3673,7 @@ fn collect_variable_object_binding_element(
     brackets: &[Option<usize>],
     start: usize,
     end: usize,
+    depth: usize,
     bindings: &mut Vec<BindingNameCandidate>,
 ) {
     let start = skip_binding_rest_dots(tokens, start, end);
@@ -3499,6 +3691,7 @@ fn collect_variable_object_binding_element(
         brackets,
         target_start,
         end,
+        depth,
         bindings,
     );
 }
@@ -3510,6 +3703,7 @@ fn collect_variable_binding_target(
     brackets: &[Option<usize>],
     start: usize,
     end: usize,
+    depth: usize,
     bindings: &mut Vec<BindingNameCandidate>,
 ) {
     let start = skip_binding_rest_dots(tokens, start, end);
@@ -3529,6 +3723,7 @@ fn collect_variable_binding_target(
                     brackets,
                     start,
                     pattern_close,
+                    depth + 1,
                     bindings,
                 );
             }
@@ -3680,12 +3875,13 @@ fn collect_export_anchors(builder: &mut AnchorBuilder, mut exports: Vec<ExportCa
 
 fn collect_default_export_anchors(
     tokens: &[Token],
+    brace_prefix: &[i32],
     parens: &[Option<usize>],
     braces: &[Option<usize>],
     exports: &mut Vec<ExportCandidate>,
 ) {
     for index in 0..tokens.len() {
-        if tokens[index].text != "export" || !is_top_level(tokens, index) {
+        if tokens[index].text != "export" || !is_top_level(tokens, brace_prefix, index) {
             continue;
         }
         let mut cursor = index + 1;
@@ -3730,11 +3926,12 @@ fn collect_default_export_anchors(
 
 fn collect_export_alias_anchors(
     tokens: &[Token],
+    brace_prefix: &[i32],
     declarations: &HashMap<String, ExportCandidate>,
     exports: &mut Vec<ExportCandidate>,
 ) {
     for index in 0..tokens.len() {
-        if tokens[index].text != "export" || !is_top_level(tokens, index) {
+        if tokens[index].text != "export" || !is_top_level(tokens, brace_prefix, index) {
             continue;
         }
         let mut open_index = index + 1;
@@ -3809,10 +4006,11 @@ fn collect_export_alias_anchors(
 
 fn collect_import_equals_declarations(
     tokens: &[Token],
+    brace_prefix: &[i32],
     declarations: &mut HashMap<String, ExportCandidate>,
 ) {
     for index in 0..tokens.len() {
-        if tokens[index].text != "import" || !is_top_level(tokens, index) {
+        if tokens[index].text != "import" || !is_top_level(tokens, brace_prefix, index) {
             continue;
         }
         let Some(name_index) = import_alias_name_index(tokens, index) else {
@@ -3821,7 +4019,7 @@ fn collect_import_equals_declarations(
         if import_alias_tail_is_non_alias(tokens, name_index) {
             continue;
         }
-        let end_index = import_alias_end_index(tokens, name_index);
+        let end_index = import_alias_end_index(tokens, brace_prefix, name_index);
         let start_index = leading_export_index(tokens, index).unwrap_or(index);
         declarations
             .entry(tokens[name_index].text.clone())
@@ -3862,9 +4060,10 @@ fn import_alias_tail_is_non_alias(tokens: &[Token], name_index: usize) -> bool {
         .is_some_and(|token| matches!(token.text.as_str(), "," | "from"))
 }
 
-fn import_alias_end_index(tokens: &[Token], name_index: usize) -> usize {
+fn import_alias_end_index(tokens: &[Token], brace_prefix: &[i32], name_index: usize) -> usize {
     let start = name_index + 1;
-    let limit = next_top_level_declaration_after(tokens, start).unwrap_or(tokens.len());
+    let limit =
+        next_top_level_declaration_after(tokens, brace_prefix, start).unwrap_or(tokens.len());
     for index in start..limit {
         if tokens[index].text == ";" {
             return index;
@@ -3931,9 +4130,13 @@ fn invalid_export_alias_target_recovery(
     (String::new(), !is_identifier(&token.text))
 }
 
-fn collect_export_import_anchors(tokens: &[Token], exports: &mut Vec<ExportCandidate>) {
+fn collect_export_import_anchors(
+    tokens: &[Token],
+    brace_prefix: &[i32],
+    exports: &mut Vec<ExportCandidate>,
+) {
     for index in 0..tokens.len() {
-        if tokens[index].text != "export" || !is_top_level(tokens, index) {
+        if tokens[index].text != "export" || !is_top_level(tokens, brace_prefix, index) {
             continue;
         }
         if tokens
@@ -3948,7 +4151,7 @@ fn collect_export_import_anchors(tokens: &[Token], exports: &mut Vec<ExportCandi
         if import_alias_tail_is_non_alias(tokens, name_index) {
             continue;
         }
-        let end_index = import_alias_end_index(tokens, name_index);
+        let end_index = import_alias_end_index(tokens, brace_prefix, name_index);
         exports.push(ExportCandidate::new(
             tokens[name_index].text.clone(),
             tokens[index].line,
@@ -3963,12 +4166,13 @@ fn collect_export_import_anchors(tokens: &[Token], exports: &mut Vec<ExportCandi
 fn collect_export_assignment_namespace_anchors(
     source: &str,
     tokens: &[Token],
+    brace_prefix: &[i32],
     parens: &[Option<usize>],
     braces: &[Option<usize>],
     exports: &mut Vec<ExportCandidate>,
 ) {
     for index in 0..tokens.len() {
-        if tokens[index].text != "export" || !is_top_level(tokens, index) {
+        if tokens[index].text != "export" || !is_top_level(tokens, brace_prefix, index) {
             continue;
         }
         if tokens.get(index + 1).is_none_or(|token| token.text != "=") {
@@ -3981,24 +4185,47 @@ fn collect_export_assignment_namespace_anchors(
         else {
             continue;
         };
-        collect_exported_namespace_members(source, tokens, parens, braces, namespace_name, exports);
+        collect_exported_namespace_members(
+            source,
+            tokens,
+            brace_prefix,
+            parens,
+            braces,
+            namespace_name,
+            exports,
+        );
     }
 }
 
 fn collect_exported_namespace_members(
     source: &str,
     tokens: &[Token],
+    brace_prefix: &[i32],
     parens: &[Option<usize>],
     braces: &[Option<usize>],
     namespace_name: &str,
     exports: &mut Vec<ExportCandidate>,
 ) {
-    collect_exported_enum_members(tokens, parens, braces, namespace_name, exports);
-    let ambient_declarations =
-        collect_ambient_namespace_declarations(source, tokens, parens, braces, namespace_name);
+    collect_exported_enum_members(
+        tokens,
+        brace_prefix,
+        parens,
+        braces,
+        namespace_name,
+        exports,
+    );
+    let ambient_declarations = collect_ambient_namespace_declarations(
+        source,
+        tokens,
+        brace_prefix,
+        parens,
+        braces,
+        namespace_name,
+    );
     let merged_exported_declarations = collect_merged_exported_namespace_declarations(
         source,
         tokens,
+        brace_prefix,
         parens,
         braces,
         namespace_name,
@@ -4006,6 +4233,7 @@ fn collect_exported_namespace_members(
     let merged_alias_declarations = collect_merged_namespace_alias_declarations(
         source,
         tokens,
+        brace_prefix,
         parens,
         braces,
         namespace_name,
@@ -4013,7 +4241,7 @@ fn collect_exported_namespace_members(
     );
     for index in 0..tokens.len() {
         if !matches!(tokens[index].text.as_str(), "namespace" | "module")
-            || !is_top_level(tokens, index)
+            || !is_top_level(tokens, brace_prefix, index)
         {
             continue;
         }
@@ -4050,8 +4278,12 @@ fn collect_exported_namespace_members(
             }
             continue;
         }
-        let suppress_exported_namespace_members =
-            exported_namespace_block_exports_suppressed(tokens, index, namespace_name);
+        let suppress_exported_namespace_members = exported_namespace_block_exports_suppressed(
+            tokens,
+            brace_prefix,
+            index,
+            namespace_name,
+        );
         let declarations = collect_namespace_member_declarations(
             source, tokens, parens, braces, body_open, body_close,
         );
@@ -4139,6 +4371,7 @@ fn collect_exported_namespace_members(
 fn collect_merged_exported_namespace_declarations(
     source: &str,
     tokens: &[Token],
+    brace_prefix: &[i32],
     parens: &[Option<usize>],
     braces: &[Option<usize>],
     namespace_name: &str,
@@ -4146,7 +4379,7 @@ fn collect_merged_exported_namespace_declarations(
     let mut declarations = HashMap::new();
     for index in 0..tokens.len() {
         if !matches!(tokens[index].text.as_str(), "namespace" | "module")
-            || !is_top_level(tokens, index)
+            || !is_top_level(tokens, brace_prefix, index)
         {
             continue;
         }
@@ -4209,6 +4442,7 @@ fn collect_merged_exported_namespace_declarations(
 fn collect_merged_namespace_alias_declarations(
     source: &str,
     tokens: &[Token],
+    brace_prefix: &[i32],
     parens: &[Option<usize>],
     braces: &[Option<usize>],
     namespace_name: &str,
@@ -4217,7 +4451,7 @@ fn collect_merged_namespace_alias_declarations(
     let mut specs = Vec::new();
     for index in 0..tokens.len() {
         if !matches!(tokens[index].text.as_str(), "namespace" | "module")
-            || !is_top_level(tokens, index)
+            || !is_top_level(tokens, brace_prefix, index)
         {
             continue;
         }
@@ -4310,6 +4544,7 @@ fn merge_namespace_alias_declarations(
 
 fn collect_exported_enum_members(
     tokens: &[Token],
+    brace_prefix: &[i32],
     parens: &[Option<usize>],
     braces: &[Option<usize>],
     enum_name: &str,
@@ -4317,7 +4552,7 @@ fn collect_exported_enum_members(
 ) {
     let brackets = matching_tokens(tokens, "[", "]");
     for index in 0..tokens.len() {
-        if tokens[index].text != "enum" || !is_top_level(tokens, index) {
+        if tokens[index].text != "enum" || !is_top_level(tokens, brace_prefix, index) {
             continue;
         }
         if tokens
@@ -4327,7 +4562,7 @@ fn collect_exported_enum_members(
             continue;
         }
         if leading_export_index_for_type_like(tokens, index).is_some()
-            && has_non_export_namespace_merge(tokens, index, enum_name)
+            && has_non_export_namespace_merge(tokens, brace_prefix, index, enum_name)
         {
             continue;
         }
@@ -4368,11 +4603,16 @@ fn collect_exported_enum_members(
     }
 }
 
-fn has_non_export_namespace_merge(tokens: &[Token], declaration_index: usize, name: &str) -> bool {
+fn has_non_export_namespace_merge(
+    tokens: &[Token],
+    brace_prefix: &[i32],
+    declaration_index: usize,
+    name: &str,
+) -> bool {
     for index in 0..tokens.len() {
         if index == declaration_index
             || !matches!(tokens[index].text.as_str(), "namespace" | "module")
-            || !is_top_level(tokens, index)
+            || !is_top_level(tokens, brace_prefix, index)
         {
             continue;
         }
@@ -4391,23 +4631,25 @@ fn has_non_export_namespace_merge(tokens: &[Token], declaration_index: usize, na
 
 fn exported_namespace_block_exports_suppressed(
     tokens: &[Token],
+    brace_prefix: &[i32],
     namespace_index: usize,
     namespace_name: &str,
 ) -> bool {
     if leading_export_index(tokens, namespace_index).is_none() {
         return false;
     }
-    has_non_export_namespace_merge(tokens, namespace_index, namespace_name)
-        || has_non_export_value_merge(tokens, namespace_index, namespace_name)
+    has_non_export_namespace_merge(tokens, brace_prefix, namespace_index, namespace_name)
+        || has_non_export_value_merge(tokens, brace_prefix, namespace_index, namespace_name)
 }
 
 fn has_non_export_value_merge(
     tokens: &[Token],
+    brace_prefix: &[i32],
     namespace_index: usize,
     namespace_name: &str,
 ) -> bool {
     for index in 0..tokens.len() {
-        if index == namespace_index || !is_top_level(tokens, index) {
+        if index == namespace_index || !is_top_level(tokens, brace_prefix, index) {
             continue;
         }
         if !matches!(tokens[index].text.as_str(), "function" | "class" | "enum") {
@@ -4535,6 +4777,7 @@ fn unquote_string_literal(value: &str) -> String {
 fn collect_ambient_namespace_declarations(
     source: &str,
     tokens: &[Token],
+    brace_prefix: &[i32],
     parens: &[Option<usize>],
     braces: &[Option<usize>],
     namespace_name: &str,
@@ -4542,7 +4785,7 @@ fn collect_ambient_namespace_declarations(
     let mut declarations = HashMap::new();
     for index in 0..tokens.len() {
         if !matches!(tokens[index].text.as_str(), "namespace" | "module")
-            || !is_top_level(tokens, index)
+            || !is_top_level(tokens, brace_prefix, index)
             || !is_declared_declaration(tokens, index)
         {
             continue;
@@ -4770,6 +5013,7 @@ fn namespace_variable_declaration_candidates(
                 &brackets,
                 &binding_parens,
                 pattern_open,
+                0,
                 &mut bindings,
             );
             for (name, line, order) in bindings {
@@ -4875,15 +5119,22 @@ fn collect_binding_pattern_names(
     brackets: &[Option<usize>],
     parens: &[Option<usize>],
     open_index: usize,
+    depth: usize,
     bindings: &mut Vec<(String, u32, usize)>,
 ) {
+    // Cut-vertex of the export-assignment namespace binding recursion: bound it
+    // against deeply nested destructuring patterns to avoid an uncatchable
+    // stack-overflow abort (see `MAX_SOURCE_NESTING_DEPTH`).
+    if depth >= MAX_SOURCE_NESTING_DEPTH {
+        return;
+    }
     match tokens.get(open_index).map(|token| token.text.as_str()) {
-        Some("{") => {
-            collect_object_binding_names(tokens, braces, brackets, parens, open_index, bindings)
-        }
-        Some("[") => {
-            collect_array_binding_names(tokens, braces, brackets, parens, open_index, bindings)
-        }
+        Some("{") => collect_object_binding_names(
+            tokens, braces, brackets, parens, open_index, depth, bindings,
+        ),
+        Some("[") => collect_array_binding_names(
+            tokens, braces, brackets, parens, open_index, depth, bindings,
+        ),
         _ => {}
     }
 }
@@ -4894,6 +5145,7 @@ fn collect_object_binding_names(
     brackets: &[Option<usize>],
     parens: &[Option<usize>],
     open_index: usize,
+    depth: usize,
     bindings: &mut Vec<(String, u32, usize)>,
 ) {
     let Some(close_index) = braces.get(open_index).and_then(|match_index| *match_index) else {
@@ -4915,6 +5167,7 @@ fn collect_object_binding_names(
                 parens,
                 cursor + rest_width,
                 element_end,
+                depth,
                 bindings,
             );
         } else if let Some(colon_index) =
@@ -4927,6 +5180,7 @@ fn collect_object_binding_names(
                 parens,
                 colon_index + 1,
                 element_end,
+                depth,
                 bindings,
             );
         } else if is_identifier(&tokens[cursor].text) {
@@ -4946,6 +5200,7 @@ fn collect_array_binding_names(
     brackets: &[Option<usize>],
     parens: &[Option<usize>],
     open_index: usize,
+    depth: usize,
     bindings: &mut Vec<(String, u32, usize)>,
 ) {
     let Some(close_index) = brackets
@@ -4969,6 +5224,7 @@ fn collect_array_binding_names(
             parens,
             cursor,
             element_end,
+            depth,
             bindings,
         );
         cursor = if element_end < close_index {
@@ -4986,6 +5242,7 @@ fn collect_binding_target_names(
     parens: &[Option<usize>],
     mut start: usize,
     end: usize,
+    depth: usize,
     bindings: &mut Vec<(String, u32, usize)>,
 ) {
     while let Some(rest_width) = binding_rest_width(tokens, start, end) {
@@ -4995,9 +5252,15 @@ fn collect_binding_target_names(
         return;
     };
     match token.text.as_str() {
-        "{" | "[" => {
-            collect_binding_pattern_names(tokens, braces, brackets, parens, start, bindings)
-        }
+        "{" | "[" => collect_binding_pattern_names(
+            tokens,
+            braces,
+            brackets,
+            parens,
+            start,
+            depth + 1,
+            bindings,
+        ),
         text if is_identifier(text) => {
             bindings.push((text.to_string(), token.line, start));
         }
@@ -5344,6 +5607,7 @@ fn token_index_after_line_or_block(
 
 fn collect_type_like_export_anchors(
     tokens: &[Token],
+    brace_prefix: &[i32],
     braces: &[Option<usize>],
     exports: &mut Vec<ExportCandidate>,
     declarations: &mut HashMap<String, ExportCandidate>,
@@ -5352,7 +5616,7 @@ fn collect_type_like_export_anchors(
         if !matches!(
             tokens[index].text.as_str(),
             "interface" | "type" | "enum" | "namespace" | "module"
-        ) || !is_top_level(tokens, index)
+        ) || !is_top_level(tokens, brace_prefix, index)
         {
             continue;
         }
@@ -5454,15 +5718,23 @@ fn collect_if_block_candidates(
 }
 
 fn collect_template_if_block_candidates(source: &str, blocks: &mut Vec<BlockCandidate>) {
-    collect_template_if_block_candidates_with_offset(source, 0, 0, blocks);
+    collect_template_if_block_candidates_with_offset(source, 0, 0, 0, blocks);
 }
 
 fn collect_template_if_block_candidates_with_offset(
     source: &str,
     source_offset: usize,
     line_offset: u32,
+    depth: usize,
     blocks: &mut Vec<BlockCandidate>,
 ) {
+    // Each nested `${ … }` re-enters this scanner one frame deeper (via
+    // `scan_template_literal_for_if_blocks` → `collect_template_expression_if_blocks`).
+    // Stop past the shared bound so deeply nested template literals cannot
+    // overflow the stack; deeper `if`-blocks simply go undetected (conservative).
+    if depth >= MAX_SOURCE_NESTING_DEPTH {
+        return;
+    }
     let bytes = source.as_bytes();
     let mut index = 0;
     let mut line = line_offset + 1;
@@ -5497,6 +5769,7 @@ fn collect_template_if_block_candidates_with_offset(
                 source_offset,
                 &mut index,
                 &mut line,
+                depth,
                 blocks,
             ),
             _ => index += 1,
@@ -5509,6 +5782,7 @@ fn scan_template_literal_for_if_blocks(
     source_offset: usize,
     index: &mut usize,
     line: &mut u32,
+    depth: usize,
     blocks: &mut Vec<BlockCandidate>,
 ) {
     let bytes = source.as_bytes();
@@ -5529,13 +5803,14 @@ fn scan_template_literal_for_if_blocks(
             b'$' if bytes.get(*index + 1) == Some(&b'{') => {
                 let expression_start = *index + 2;
                 let expression_start_line = *line;
-                if let Some(expression_end) = template_expression_end(source, expression_start) {
+                if let Some(expression_end) = template_expression_end(source, expression_start, 0) {
                     collect_template_expression_if_blocks(
                         source,
                         expression_start,
                         expression_end,
                         expression_start_line,
                         source_offset,
+                        depth,
                         blocks,
                     );
                     *line += count_newlines(&source[*index..=expression_end]);
@@ -5547,6 +5822,7 @@ fn scan_template_literal_for_if_blocks(
                         source.len(),
                         expression_start_line,
                         source_offset,
+                        depth,
                         blocks,
                     );
                     *line += count_newlines(&source[*index..]);
@@ -5566,6 +5842,7 @@ fn collect_template_expression_if_blocks(
     expression_end: usize,
     expression_start_line: u32,
     source_offset: usize,
+    depth: usize,
     blocks: &mut Vec<BlockCandidate>,
 ) {
     let expression = &source[expression_start..expression_end];
@@ -5585,11 +5862,20 @@ fn collect_template_expression_if_blocks(
         expression,
         source_offset + expression_start,
         expression_start_line.saturating_sub(1),
+        depth + 1,
         blocks,
     );
 }
 
-fn template_expression_end(source: &str, start: usize) -> Option<usize> {
+fn template_expression_end(source: &str, start: usize, depth: usize) -> Option<usize> {
+    // Bounded against nested `${ `${ … }` }` interpolation: each inner template
+    // literal recurses through `skip_template_literal_no_line`. Stop descending
+    // past the shared source-nesting bound so pathological input cannot overflow
+    // the stack (an uncatchable abort). Treating deeper nesting as unresolved is
+    // conservative — callers advance past the `${` and keep scanning.
+    if depth >= MAX_SOURCE_NESTING_DEPTH {
+        return None;
+    }
     let bytes = source.as_bytes();
     let mut index = start;
     let mut brace_depth = 0_i32;
@@ -5619,7 +5905,7 @@ fn template_expression_end(source: &str, start: usize) -> Option<usize> {
                     index += 1;
                 }
             }
-            b'`' => skip_template_literal_no_line(source, &mut index),
+            b'`' => skip_template_literal_no_line(source, &mut index, depth),
             b'{' => {
                 brace_depth += 1;
                 index += 1;
@@ -5720,7 +6006,7 @@ fn skip_quoted_source_no_line(bytes: &[u8], index: &mut usize) {
     }
 }
 
-fn skip_template_literal_no_line(source: &str, index: &mut usize) {
+fn skip_template_literal_no_line(source: &str, index: &mut usize, depth: usize) {
     let bytes = source.as_bytes();
     *index += 1;
     while *index < bytes.len() {
@@ -5731,7 +6017,8 @@ fn skip_template_literal_no_line(source: &str, index: &mut usize) {
                 break;
             }
             b'$' if bytes.get(*index + 1) == Some(&b'{') => {
-                if let Some(expression_end) = template_expression_end(source, *index + 2) {
+                if let Some(expression_end) = template_expression_end(source, *index + 2, depth + 1)
+                {
                     *index = expression_end + 1;
                 } else {
                     *index += 2;
@@ -5762,7 +6049,7 @@ fn skip_template_literal_source(source: &str, index: &mut usize, line: &mut u32)
                 break;
             }
             b'$' if bytes.get(*index + 1) == Some(&b'{') => {
-                if let Some(expression_end) = template_expression_end(source, *index + 2) {
+                if let Some(expression_end) = template_expression_end(source, *index + 2, 0) {
                     *line += count_newlines(&source[*index..=expression_end]);
                     *index = expression_end + 1;
                 } else {
@@ -5785,10 +6072,10 @@ fn unclosed_template_expression_resume_index(source: &str, template_start: usize
             b'`' => return None,
             b'$' if bytes.get(index + 1) == Some(&b'{') => {
                 let expression_start = index + 2;
-                if template_expression_end(source, expression_start).is_none() {
+                if template_expression_end(source, expression_start, 0).is_none() {
                     return Some(expression_start);
                 }
-                index = template_expression_end(source, expression_start)? + 1;
+                index = template_expression_end(source, expression_start, 0)? + 1;
             }
             _ => index += 1,
         }
@@ -6409,7 +6696,25 @@ fn if_statement_end(
     braces: &[Option<usize>],
     body_start: usize,
 ) -> Option<usize> {
-    let body_end = statement_end(tokens, parens, braces, body_start)?;
+    if_statement_end_bounded(tokens, parens, braces, body_start, 0)
+}
+
+fn if_statement_end_bounded(
+    tokens: &[Token],
+    parens: &[Option<usize>],
+    braces: &[Option<usize>],
+    body_start: usize,
+    depth: usize,
+) -> Option<usize> {
+    // A chained `else if … else if …` recurses once per link
+    // (`if_statement_end` → `statement_end` → `if_statement_end`). Stop past the
+    // shared bound so a long chain cannot overflow the stack (an uncatchable
+    // abort). Reporting the body end reached so far is conservative — the outer
+    // `if` block is still detected, just with a truncated span.
+    if depth >= MAX_SOURCE_NESTING_DEPTH {
+        return None;
+    }
+    let body_end = statement_end_bounded(tokens, parens, braces, body_start, depth)?;
     let else_index = body_end + 1;
     if tokens
         .get(else_index)
@@ -6418,14 +6723,15 @@ fn if_statement_end(
         return Some(body_end);
     }
 
-    statement_end(tokens, parens, braces, else_index + 1).or(Some(else_index))
+    statement_end_bounded(tokens, parens, braces, else_index + 1, depth).or(Some(else_index))
 }
 
-fn statement_end(
+fn statement_end_bounded(
     tokens: &[Token],
     parens: &[Option<usize>],
     braces: &[Option<usize>],
     body_start: usize,
+    depth: usize,
 ) -> Option<usize> {
     let token = tokens.get(body_start)?;
     if tokens
@@ -6439,7 +6745,7 @@ fn statement_end(
         let paren_close = parens
             .get(paren_open)
             .and_then(|match_index| *match_index)?;
-        return if_statement_end(tokens, parens, braces, paren_close + 1);
+        return if_statement_end_bounded(tokens, parens, braces, paren_close + 1, depth + 1);
     }
     Some(find_expression_end(tokens, body_start))
 }
@@ -6462,6 +6768,23 @@ fn complexity_between(
     end: usize,
     skip_control_at: Option<usize>,
 ) -> u32 {
+    complexity_between_bounded(tokens, start, end, skip_control_at, 0)
+}
+
+fn complexity_between_bounded(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+    skip_control_at: Option<usize>,
+    depth: usize,
+) -> u32 {
+    // Template-literal tokens recurse into `template_interpolation_complexity`,
+    // which re-enters this function for each nested `${ … }`. Stop past the
+    // shared bound so deeply nested interpolation cannot overflow the stack;
+    // the deepest levels simply contribute no extra complexity (conservative).
+    if depth >= MAX_SOURCE_NESTING_DEPTH {
+        return 1;
+    }
     let mut complexity = 1;
     let mut index = start;
     while index <= end && index < tokens.len() {
@@ -6476,7 +6799,7 @@ fn complexity_between(
                     complexity += 1;
                 }
                 text if text.starts_with('`') => {
-                    complexity += template_interpolation_complexity(text);
+                    complexity += template_interpolation_complexity(text, depth);
                 }
                 _ => {}
             }
@@ -6486,7 +6809,7 @@ fn complexity_between(
     complexity
 }
 
-fn template_interpolation_complexity(template: &str) -> u32 {
+fn template_interpolation_complexity(template: &str, depth: usize) -> u32 {
     let bytes = template.as_bytes();
     if bytes.first() != Some(&b'`') {
         return 0;
@@ -6500,14 +6823,19 @@ fn template_interpolation_complexity(template: &str) -> u32 {
         }
         if bytes[index] == b'$' && bytes[index + 1] == b'{' {
             let expression_start = index + 2;
-            let Some(expression_end) = template_expression_end(template, expression_start) else {
+            let Some(expression_end) = template_expression_end(template, expression_start, 0)
+            else {
                 break;
             };
             let expression_tokens = tokenize(&template[expression_start..expression_end]);
             if !expression_tokens.is_empty() {
-                complexity +=
-                    complexity_between(&expression_tokens, 0, expression_tokens.len() - 1, None)
-                        - 1;
+                complexity += complexity_between_bounded(
+                    &expression_tokens,
+                    0,
+                    expression_tokens.len() - 1,
+                    None,
+                    depth + 1,
+                ) - 1;
             }
             index = expression_end + 1;
             continue;
@@ -6675,26 +7003,30 @@ fn is_export_default_modifier(value: &str) -> bool {
     matches!(value, "async")
 }
 
-fn is_top_level(tokens: &[Token], index: usize) -> bool {
+/// Prefix sums of brace depth over the token stream: entry `i` is the net
+/// `{`/`}` depth of `tokens[0..i]`, length `tokens.len() + 1`. Lets
+/// `is_top_level` be an O(1) lookup instead of an O(index) re-scan, which
+/// removes the O(n²) blowup in the TypeScript/TSX extractor on
+/// declaration-dense files.
+fn brace_depth_prefix_sums(tokens: &[Token]) -> Vec<i32> {
+    let mut prefix = Vec::with_capacity(tokens.len() + 1);
     let mut depth = 0_i32;
-    for token in &tokens[..index] {
+    prefix.push(0);
+    for token in tokens {
         match token.text.as_str() {
             "{" => depth += 1,
             "}" => depth -= 1,
             _ => {}
         }
+        prefix.push(depth);
     }
-    depth == 0
-        || leading_export_index(tokens, index).is_some_and(|export_index| {
-            tokens[..export_index]
-                .iter()
-                .fold(0_i32, |depth, token| match token.text.as_str() {
-                    "{" => depth + 1,
-                    "}" => depth - 1,
-                    _ => depth,
-                })
-                == 0
-        })
+    prefix
+}
+
+fn is_top_level(tokens: &[Token], brace_prefix: &[i32], index: usize) -> bool {
+    brace_prefix.get(index).copied() == Some(0)
+        || leading_export_index(tokens, index)
+            .is_some_and(|export_index| brace_prefix.get(export_index).copied() == Some(0))
 }
 
 fn find_next_text(tokens: &[Token], start: usize, text: &str) -> Option<usize> {
@@ -12314,6 +12646,74 @@ int Store::set(int value)
             ),
             (3, 8, AnchorKind::Method, 14, AnchorKind::Method)
         );
+    }
+
+    #[test]
+    fn cpp_scoped_enum_does_not_emit_phantom_class_or_struct_anchor() {
+        // F17: `enum class` / `enum struct` must not also emit a phantom
+        // class:/struct: anchor for the consumed keyword.
+        let color = extract_anchors(
+            &RelativePath::new("x.cpp").unwrap(),
+            "enum class Color { Red, Green };",
+        );
+        assert_eq!(
+            color
+                .anchors
+                .iter()
+                .map(|(anchor, _)| anchor.as_str())
+                .collect::<Vec<_>>(),
+            vec!["enum:Color"]
+        );
+
+        let status = extract_anchors(
+            &RelativePath::new("x.cpp").unwrap(),
+            "enum struct Status { Ok, Err };",
+        );
+        assert_eq!(
+            status
+                .anchors
+                .iter()
+                .map(|(anchor, _)| anchor.as_str())
+                .collect::<Vec<_>>(),
+            vec!["enum:Status"]
+        );
+
+        // A real same-named class must keep its canonical anchor (not be demoted
+        // to `class:Color#2` by a phantom claiming the base name first).
+        let collision = extract_anchors(
+            &RelativePath::new("x.cpp").unwrap(),
+            "enum class Color { Red };\nclass Color { int x; };\n",
+        );
+        let mut anchors = collision
+            .anchors
+            .iter()
+            .map(|(anchor, _)| anchor.as_str())
+            .collect::<Vec<_>>();
+        anchors.sort_unstable();
+        assert_eq!(anchors, vec!["class:Color", "enum:Color"]);
+        assert_eq!(collision.anchors.get_str("class:Color").unwrap().start, 2);
+        assert_eq!(collision.anchors.get_str("enum:Color").unwrap().start, 1);
+    }
+
+    #[test]
+    fn cpp_destructor_is_distinct_from_constructor() {
+        // F18: a destructor must anchor as `Class.~Class`, distinct from the
+        // constructor `Class.Class`.
+        let extraction = extract_anchors(
+            &RelativePath::new("a.cpp").unwrap(),
+            "class A {\n  A() {}\n  ~A() { cleanup(); }\n  void normal() {}\n};\n",
+        );
+        let mut anchors = extraction
+            .anchors
+            .iter()
+            .map(|(anchor, _)| anchor.as_str())
+            .collect::<Vec<_>>();
+        anchors.sort_unstable();
+        assert_eq!(anchors, vec!["class:A", "fn:A.A", "fn:A.normal", "fn:A.~A"]);
+        // No collision-suffixed anchors: constructor and destructor are distinct.
+        assert!(extraction.anchors.get_str("fn:A.A#2").is_none());
+        assert_eq!(extraction.anchors.get_str("fn:A.A").unwrap().start, 2);
+        assert_eq!(extraction.anchors.get_str("fn:A.~A").unwrap().start, 3);
     }
 
     #[test]

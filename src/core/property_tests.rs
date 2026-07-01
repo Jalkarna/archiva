@@ -60,7 +60,16 @@ fn property_yaml_roundtrips_rendered_values() {
     for _ in 0..DEFAULT_CASES {
         let value = yaml_document(&mut rng);
         let rendered = render_yaml(&value);
-        assert_eq!(parse_yaml(&rendered).unwrap(), value);
+        let parsed = match parse_yaml(&rendered) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                panic!("parse failed: {error:?}\n--- rendered ---\n{rendered}\n--- end ---")
+            }
+        };
+        assert_eq!(
+            parsed, value,
+            "round-trip failed\n--- rendered ---\n{rendered}\n--- end ---"
+        );
     }
 }
 
@@ -382,18 +391,80 @@ fn random_text(rng: &mut Rng, max_len: usize) -> String {
 }
 
 fn random_yaml_string(rng: &mut Rng, max_len: usize) -> String {
-    let len = rng.usize(max_len + 1);
-    match len {
-        0 => String::new(),
-        1 => random_yaml_edge_char(rng).to_string(),
-        _ => {
+    // Occasionally emit strings that exercise the block-scalar / folding /
+    // quoting paths of the renderer: long (>100) values, internal whitespace
+    // runs, tabs, CR/CRLF, embedded newlines, and leading/trailing spaces.
+    // These categories previously round-tripped incorrectly (data corruption),
+    // so the round-trip property must cover them.
+    match rng.usize(8) {
+        0 => {
+            // Long, word-wrapped prose with occasional double spaces.
+            let words = 20 + rng.usize(40);
             let mut output = String::new();
-            output.push(random_yaml_edge_char(rng));
-            for _ in 0..(len - 2) {
-                output.push(random_yaml_inner_char(rng));
+            for index in 0..words {
+                if index > 0 {
+                    output.push(' ');
+                    if rng.usize(5) == 0 {
+                        output.push(' ');
+                    }
+                }
+                for _ in 0..(1 + rng.usize(6)) {
+                    output.push(random_yaml_edge_char(rng));
+                }
             }
-            output.push(random_yaml_edge_char(rng));
             output
+        }
+        1 => {
+            // Multiline content (literal-block candidate).
+            let lines = 2 + rng.usize(4);
+            let mut parts = Vec::new();
+            for _ in 0..lines {
+                let len = rng.usize(30);
+                let mut line = String::new();
+                for _ in 0..len {
+                    line.push(random_yaml_inner_char(rng));
+                }
+                parts.push(line);
+            }
+            parts.join("\n")
+        }
+        2 => {
+            // Whitespace-sensitive: tabs, CR, CRLF, leading/trailing spaces.
+            let choices = [
+                "a\tb",
+                "a\rb",
+                "a\r\nb",
+                "  leading",
+                "trailing  ",
+                "\n",
+                "a\nb\n",
+            ];
+            let base = choices[rng.usize(choices.len())].to_string();
+            if rng.bool() {
+                let mut long = base.clone();
+                while long.len() < 120 {
+                    long.push('z');
+                }
+                long
+            } else {
+                base
+            }
+        }
+        _ => {
+            let len = rng.usize(max_len + 1);
+            match len {
+                0 => String::new(),
+                1 => random_yaml_edge_char(rng).to_string(),
+                _ => {
+                    let mut output = String::new();
+                    output.push(random_yaml_edge_char(rng));
+                    for _ in 0..(len - 2) {
+                        output.push(random_yaml_inner_char(rng));
+                    }
+                    output.push(random_yaml_edge_char(rng));
+                    output
+                }
+            }
         }
     }
 }

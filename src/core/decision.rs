@@ -101,11 +101,34 @@ pub fn build_decision_record(
     env_session: Option<&str>,
     history: Vec<DecisionHistoryEntry>,
 ) -> DecisionRecord {
-    let selected_source = get_lines(source, input.lines.start as usize, input.lines.end as usize);
+    // Snap the recorded range to the extractor's live span for the anchor, and
+    // fingerprint that same span. `post_tool_use` re-anchors a resolving anchor
+    // to exactly this extractor position (audit blocker B3), so deriving both
+    // `lines_hint` and `fingerprint` from it at write time keeps the invariant
+    // `fingerprint(get_lines(source, lines_hint)) == fingerprint` intact after a
+    // re-anchor of unchanged code — otherwise a caller whose `input.lines`
+    // differs from the AST node span (e.g. a body-only or approximate range from
+    // an MCP `write_decision`) would be falsely marked STALE on the first
+    // `post_tool_use`. Fall back to the caller's range only if the anchor does
+    // not resolve (it was validated to exist, but the extractor may be
+    // incomplete on pathological input).
+    let anchor_range = crate::core::anchor::extract_anchors(&input.file, source)
+        .anchors
+        .get_str(&input.anchor)
+        .map(|info| LineRange {
+            start: info.start,
+            end: info.end,
+        })
+        .unwrap_or_else(|| input.lines.clone());
+    let selected_source = get_lines(
+        source,
+        anchor_range.start as usize,
+        anchor_range.end as usize,
+    );
 
     DecisionRecord {
         id: id.into(),
-        lines_hint: input.lines.clone(),
+        lines_hint: anchor_range,
         fingerprint: fingerprint(&selected_source),
         chose: input.chose.clone(),
         because: input.because.clone(),
@@ -267,6 +290,28 @@ pub fn append_session_report_file(output: &mut String, file: &RelativePath, dlog
 
 pub fn finish_session_report(output: String) -> String {
     trim_end_newlines(output)
+}
+
+/// Append a "skipped corrupt file" section to a session report so a malformed
+/// `.dlog` is named rather than silently ignored (audit blocker B5). Each entry
+/// is `(file, message)`. No-op when there are no corrupt files.
+pub fn append_session_report_corrupt(output: &mut String, corrupt: &[(RelativePath, String)]) {
+    if corrupt.is_empty() {
+        return;
+    }
+    writeln!(
+        output,
+        "[Archiva] {} decision log{} could not be parsed and {} skipped:",
+        corrupt.len(),
+        if corrupt.len() == 1 { "" } else { "s" },
+        if corrupt.len() == 1 { "was" } else { "were" },
+    )
+    .expect("writing to a String cannot fail");
+    for (file, message) in corrupt {
+        writeln!(output, "  {}: {}", file.as_str(), message)
+            .expect("writing to a String cannot fail");
+    }
+    output.push('\n');
 }
 
 pub fn format_decision(anchor: &str, decision: &DecisionRecord) -> String {

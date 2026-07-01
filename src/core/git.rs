@@ -27,7 +27,14 @@ const GIT_PACK_INDEX_FANOUT_BYTES: u64 = 256 * 4;
 const GIT_PACK_INDEX_CRC_BYTES: u64 = 4;
 const GIT_PACK_INDEX_OFFSET_BYTES: u64 = 4;
 const GIT_PACK_INDEX_LARGE_OFFSET_BYTES: u64 = 8;
-const GIT_PACK_DELTA_MAX_DEPTH: usize = 32;
+// Git's default `pack.depth` is 50 and users can repack with a higher
+// `--depth`, so this bound must sit comfortably above it or a legitimately
+// packed repository fails to resolve deeply-chained deltas (the previous cap of
+// 32 was below git's own default — a correctness bug). 256 gives generous
+// headroom for aggressively repacked repos while still bounding a malicious or
+// corrupt chain; delta resolution recurses one stack frame per level, which is
+// safe at this depth on the main thread.
+const GIT_PACK_DELTA_MAX_DEPTH: usize = 256;
 const GIT_ALTERNATES_MAX_DEPTH: usize = 8;
 const GIT_SYMBOLIC_REF_MAX_DEPTH: usize = 8;
 

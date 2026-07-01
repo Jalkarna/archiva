@@ -29,6 +29,7 @@ pub enum LintRule {
     Orphan,
     Undecided,
     Supersede,
+    Corrupt,
 }
 
 impl LintRule {
@@ -39,6 +40,7 @@ impl LintRule {
             Self::Orphan => "arc/orphan",
             Self::Undecided => "arc/undecided",
             Self::Supersede => "arc/supersede",
+            Self::Corrupt => "arc/corrupt",
         }
     }
 }

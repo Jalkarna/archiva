@@ -10,6 +10,9 @@ type CommandResult = {
   stderr: string;
 };
 
+const WHY_LINE_IMPROVEMENT_REASON =
+  "Rust's MCP `why` tool intentionally accepts a `line` argument for line-based lookup (audit blocker B12: TypeScript silently dropped `line` and returned a confidently-wrong whole-file result), so its tools/list schema adds a `line` property and an updated description; all other tool surface is identical.";
+
 type Runtime = {
   name: string;
   command: string;
@@ -185,7 +188,9 @@ results.push(await scenario("cli-dash-operand-parity", async (runtime) => {
   };
 }));
 
-results.push(await scenario("cli-help-error-parity", async (runtime) => {
+results.push(await knownImprovementScenario(
+  "cli-help-error-parity",
+  async (runtime) => {
   const root = await tempProject(runtime.name, "cli-help-error-parity");
   await fs.mkdir(path.join(root, "src"), { recursive: true });
   await fs.writeFile(path.join(root, "src/a.ts"), "export function a() {\n  return 1;\n}\n", "utf8");
@@ -208,7 +213,18 @@ results.push(await scenario("cli-help-error-parity", async (runtime) => {
     writeJsonOptionIgnoresStdin: run(runtime, ["write-decision", `--json=${payload}`], "{bad stdin", root),
     files: normalizeFiles(await readProjectFiles(root, [".decisions/src/a.ts.dlog", ".decisions/src/a.ts.dmap"]))
   };
-}));
+  },
+  (typescript, rust) => {
+    // Rust's root help lists a global `-v, --verbose` diagnostic flag that
+    // TypeScript lacks (audit blocker B9 observability). Strip that one line
+    // wherever it appears, then require every help/error surface to match
+    // exactly — so any divergence other than the documented flag still fails.
+    const stripVerbose = (value: unknown): string =>
+      JSON.stringify(value).replace(/\\n +-v, --verbose +enable diagnostic logging to stderr/g, "");
+    return stripVerbose(typescript) === stripVerbose(rust);
+  },
+  "Rust's root help advertises a global `-v, --verbose` diagnostic-logging flag (audit blocker B9: observability) that the TypeScript CLI does not have; all other help text, error messages, exit codes, and written files are identical."
+));
 
 results.push(await knownImprovementScenario(
   "cli-extra-argument-hardening-improvement",
@@ -484,7 +500,9 @@ results.push(await knownImprovementScenario(
   "Rust intentionally rejects source files whose existing symlink target canonicalizes outside the project root while TypeScript follows the symlink and writes decision storage."
 ));
 
-results.push(await scenario("corrupt-dlog-command-failures", async (runtime) => {
+results.push(await knownImprovementScenario(
+  "corrupt-dlog-command-failures",
+  async (runtime) => {
   const root = await tempProject(runtime.name, "corrupt-dlog-command-failures");
   await fs.mkdir(path.join(root, "src"), { recursive: true });
   await fs.mkdir(path.join(root, ".decisions/src"), { recursive: true });
@@ -510,7 +528,16 @@ results.push(await scenario("corrupt-dlog-command-failures", async (runtime) => 
 
   return {
     why: normalizeCorruptDlogFailure(why),
-    lint: normalizeCorruptDlogFailure(lint),
+    lint: {
+      status: lint.status,
+      // Rust skip-and-reports the corrupt file as an `arc/corrupt` lint issue
+      // on stdout; TypeScript aborts with the schema error on stderr. Reduce to
+      // the shared signal (non-zero exit + corruption surfaced *somewhere*) so
+      // the intentional B5 behavior change is accepted while a regression that
+      // silently ignored the corrupt file would still fail.
+      surfacesCorruption:
+        /arc\/corrupt/.test(lint.stdout) || /schema/.test(lint.stderr)
+    },
     write: normalizeCorruptDlogFailure(write),
     files: normalizeFiles(await readProjectFiles(root, [
       ".decisions/src/bad.ts.dlog",
@@ -519,7 +546,27 @@ results.push(await scenario("corrupt-dlog-command-failures", async (runtime) => 
     ])),
     tempSiblings: await decisionTempSiblings(root, "src")
   };
-}));
+  },
+  (typescript, rust) => {
+    // `lint` is the intentional divergence (B5 skip-and-report). Everything
+    // else — why, write, on-disk files, temp siblings — must match exactly, and
+    // both runtimes must still exit non-zero from lint having surfaced the
+    // corruption.
+    const tsLint = typescript.lint as { status: number; surfacesCorruption: boolean };
+    const rustLint = rust.lint as { status: number; surfacesCorruption: boolean };
+    return (
+      JSON.stringify(typescript.why) === JSON.stringify(rust.why) &&
+      JSON.stringify(typescript.write) === JSON.stringify(rust.write) &&
+      JSON.stringify(typescript.files) === JSON.stringify(rust.files) &&
+      JSON.stringify(typescript.tempSiblings) === JSON.stringify(rust.tempSiblings) &&
+      tsLint.status === 1 &&
+      rustLint.status === 1 &&
+      tsLint.surfacesCorruption &&
+      rustLint.surfacesCorruption
+    );
+  },
+  "Rust whole-repo `lint` intentionally skips-and-reports a corrupt .dlog as an `arc/corrupt` error issue (naming the file) instead of aborting the whole command like TypeScript (audit blocker B5); single-file `why`/`write` still fail hard identically and the corrupt file is left untouched."
+));
 
 results.push(await knownImprovementScenario(
   "dlog-yaml-depth-limit-improvement",
@@ -5395,7 +5442,9 @@ const after = () => true;
   };
 }));
 
-results.push(await scenario("mcp-initialize-tools", async (runtime) => {
+results.push(await knownImprovementScenario(
+  "mcp-initialize-tools",
+  async (runtime) => {
   const root = await tempProject(runtime.name, "mcp-initialize-tools");
   return {
     command: run(
@@ -5408,7 +5457,14 @@ results.push(await scenario("mcp-initialize-tools", async (runtime) => {
       root
     )
   };
-}));
+  },
+  (typescript, rust) =>
+    typescript.command.status === rust.command.status &&
+    typescript.command.stderr === rust.command.stderr &&
+    JSON.stringify(canonicalizeWhyToolImprovement(normalizeMcpResponses(typescript.command.stdout))) ===
+      JSON.stringify(canonicalizeWhyToolImprovement(normalizeMcpResponses(rust.command.stdout))),
+  WHY_LINE_IMPROVEMENT_REASON
+));
 
 results.push(await scenario("mcp-write-why-supersede-session", async (runtime) => {
   const root = await tempProject(runtime.name, "mcp-write-why-supersede-session");
@@ -5571,7 +5627,9 @@ results.push(await scenario("mcp-stdio-edge-cases", async (runtime) => {
   };
 }));
 
-results.push(await scenario("mcp-notification-and-no-id-parity", async (runtime) => {
+results.push(await knownImprovementScenario(
+  "mcp-notification-and-no-id-parity",
+  async (runtime) => {
   const root = await tempProject(runtime.name, "mcp-notification-and-no-id-parity");
   const command = run(
     runtime,
@@ -5595,9 +5653,14 @@ results.push(await scenario("mcp-notification-and-no-id-parity", async (runtime)
     stdout: normalizeMcpResponses(command.stdout),
     stderr: command.stderr
   };
-}));
+  },
+  mcpToolsListImprovementAccepts,
+  WHY_LINE_IMPROVEMENT_REASON
+));
 
-results.push(await scenario("mcp-notification-suppresses-tool-side-effects", async (runtime) => {
+results.push(await knownImprovementScenario(
+  "mcp-notification-suppresses-tool-side-effects",
+  async (runtime) => {
   const root = await tempProject(runtime.name, "mcp-notification-suppresses-tool-side-effects");
   await fs.mkdir(path.join(root, "src"), { recursive: true });
   await fs.writeFile(path.join(root, "src/notify.ts"), "export function notify() {\n  return 1;\n}\n", "utf8");
@@ -5634,9 +5697,19 @@ results.push(await scenario("mcp-notification-suppresses-tool-side-effects", asy
       ".decisions/src/notify.ts.dmap"
     ]))
   };
-}));
+  },
+  (typescript, rust) =>
+    JSON.stringify(typescript.files) === JSON.stringify(rust.files) &&
+    mcpToolsListImprovementAccepts(
+      { status: typescript.status, stdout: typescript.stdout, stderr: typescript.stderr },
+      { status: rust.status, stdout: rust.stdout, stderr: rust.stderr }
+    ),
+  WHY_LINE_IMPROVEMENT_REASON
+));
 
-results.push(await scenario("mcp-invalid-utf8-stdio-resilience", async (runtime) => {
+results.push(await knownImprovementScenario(
+  "mcp-invalid-utf8-stdio-resilience",
+  async (runtime) => {
   const root = await tempProject(runtime.name, "mcp-invalid-utf8-stdio-resilience");
   const input = Buffer.concat([
     Buffer.from([0xff, 0x0a]),
@@ -5648,7 +5721,10 @@ results.push(await scenario("mcp-invalid-utf8-stdio-resilience", async (runtime)
     stdout: normalizeMcpResponses(command.stdout),
     stderr: command.stderr
   };
-}));
+  },
+  mcpToolsListImprovementAccepts,
+  WHY_LINE_IMPROVEMENT_REASON
+));
 
 results.push(await knownImprovementScenario(
   "mcp-oversized-stdio-hardening-improvement",
@@ -6385,12 +6461,33 @@ results.push(await knownImprovementScenario(
   "Rust intentionally recovers git-renamed decision logs while the TypeScript oracle no-ops when the target path has no dlog."
 ));
 
-results.push(await scenario("post-tool-use-empty-env", async (runtime) => {
+results.push(await knownImprovementScenario(
+  "post-tool-use-empty-env",
+  async (runtime) => {
   const root = await tempProject(runtime.name, "post-tool-use-empty-env");
   return {
     command: run(runtime, ["hooks", "post-tool-use"], "", root, { ARCHIVA_FILE: "" })
   };
-}));
+  },
+  (typescript, rust) => {
+    // With no positional path, no stdin payload, and an empty ARCHIVA_FILE,
+    // both runtimes fail with a "missing file path" error and exit 1. Rust's
+    // message additionally mentions the stdin hook payload path it now supports
+    // (audit blocker B2); the observable contract (exit 1, empty stdout, an
+    // error naming the missing file path) is identical.
+    const ts = typescript.command;
+    const rs = rust.command;
+    return (
+      ts.status === 1 &&
+      rs.status === 1 &&
+      ts.stdout === "" &&
+      rs.stdout === "" &&
+      /Missing file path/.test(ts.stderr) &&
+      /Missing file path/.test(rs.stderr)
+    );
+  },
+  "Rust `post-tool-use` now also reads the Claude Code hook payload from stdin (audit blocker B2), so its missing-file-path error additionally mentions the stdin path; the exit code, empty stdout, and missing-file-path error contract are otherwise identical to TypeScript."
+));
 
 results.push(await scenario("post-tool-use-orphan-return", async (runtime) => {
   const root = await tempProject(runtime.name, "post-tool-use-orphan-return");
@@ -6713,6 +6810,45 @@ function normalizeMcpResponses(stdout: string): unknown[] {
       return response;
     });
 }
+
+// The Rust `why` MCP tool intentionally adds a `line` property and an updated
+// description (audit blocker B12: line-based lookup that TypeScript silently
+// dropped). This canonicalizes the `why` tool entry in any tools/list response
+// so the shared surface (write_decision, ghost_check, and why's file/anchor
+// props) is still compared exactly, while the documented B12 addition is
+// accepted. Mutates in place and returns the same array for chaining.
+function canonicalizeWhyToolImprovement(responses: unknown[]): unknown[] {
+  for (const response of responses) {
+    const tools = (response as { result?: { tools?: unknown[] } })?.result?.tools;
+    if (!Array.isArray(tools)) continue;
+    for (const tool of tools as Array<{
+      name?: string;
+      description?: string;
+      inputSchema?: { properties?: Record<string, unknown> };
+    }>) {
+      if (tool?.name === "why") {
+        if (tool.inputSchema?.properties) {
+          delete tool.inputSchema.properties.line;
+        }
+        tool.description = "<why-description>";
+      }
+    }
+  }
+  return responses;
+}
+
+function mcpToolsListImprovementAccepts(
+  typescript: { status: number | null; stdout: unknown[]; stderr: string },
+  rust: { status: number | null; stdout: unknown[]; stderr: string }
+): boolean {
+  return (
+    typescript.status === rust.status &&
+    typescript.stderr === rust.stderr &&
+    JSON.stringify(canonicalizeWhyToolImprovement(typescript.stdout)) ===
+      JSON.stringify(canonicalizeWhyToolImprovement(rust.stdout))
+  );
+}
+
 
 function firstMcpErrorMessage(stdout: string): string | null {
   for (const line of stdout.trim().split(/\r?\n/).filter(Boolean)) {

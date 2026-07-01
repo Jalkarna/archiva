@@ -22,11 +22,46 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.96.0
 
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
       - name: Build Rust
         run: cargo build --all-targets --locked
 
       - name: Test Rust
         run: cargo test --all-targets --locked --quiet
+
+  robustness-gates:
+    name: Robustness gates (panic-safety, MCP survival, perf)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      # Hard PR gates from the release audit (B1/B1b/B4):
+      #   - no panic/abort on any committed-style input
+      #   - MCP server survives malformed requests and continues the session
+      #   - anchor extraction stays sub-quadratic on large/dense files
+      - name: Panic-safety gate
+        run: cargo test --release --locked --test panic_safety
+
+      - name: MCP survival gate
+        run: cargo test --release --locked --test mcp_survival
+
+      - name: Anchor performance gate
+        run: cargo test --release --locked --test anchor_perf
+
+      # Deeper randomized soak over the parsers/extractor on every PR.
+      - name: Extended panic fuzz
+        run: cargo run --release --locked --example panic_fuzz -- 500000
 
   native-package:
     name: Native package ${{ matrix.target }}
