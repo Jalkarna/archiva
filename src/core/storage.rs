@@ -680,14 +680,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["fn:second"]
         );
-        // fn:second spans lines 4-6 in the source. The write-time record snaps
-        // `lines_hint` to the extractor's live span (audit blocker B3 / false-
-        // STALE fix), so the dmap reflects the anchor's true position rather
-        // than the caller's placeholder `[1, 3]` range.
-        assert_eq!(second_decision.lines_hint, LineRange { start: 4, end: 6 });
+        // TypeScript writeDecision preserves the caller-provided range, so the
+        // superseding record keeps the fixture's placeholder `[1, 3]` range even
+        // though fn:second resolves later in the file.
+        assert_eq!(second_decision.lines_hint, LineRange { start: 1, end: 3 });
         assert_eq!(
             fs::read_to_string(dmap_path(&root, &second.file)).unwrap(),
-            "4-6:fn:second\n"
+            "1-3:fn:second\n"
         );
 
         let _ = fs::remove_dir_all(root);

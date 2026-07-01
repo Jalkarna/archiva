@@ -101,34 +101,11 @@ pub fn build_decision_record(
     env_session: Option<&str>,
     history: Vec<DecisionHistoryEntry>,
 ) -> DecisionRecord {
-    // Snap the recorded range to the extractor's live span for the anchor, and
-    // fingerprint that same span. `post_tool_use` re-anchors a resolving anchor
-    // to exactly this extractor position (audit blocker B3), so deriving both
-    // `lines_hint` and `fingerprint` from it at write time keeps the invariant
-    // `fingerprint(get_lines(source, lines_hint)) == fingerprint` intact after a
-    // re-anchor of unchanged code — otherwise a caller whose `input.lines`
-    // differs from the AST node span (e.g. a body-only or approximate range from
-    // an MCP `write_decision`) would be falsely marked STALE on the first
-    // `post_tool_use`. Fall back to the caller's range only if the anchor does
-    // not resolve (it was validated to exist, but the extractor may be
-    // incomplete on pathological input).
-    let anchor_range = crate::core::anchor::extract_anchors(&input.file, source)
-        .anchors
-        .get_str(&input.anchor)
-        .map(|info| LineRange {
-            start: info.start,
-            end: info.end,
-        })
-        .unwrap_or_else(|| input.lines.clone());
-    let selected_source = get_lines(
-        source,
-        anchor_range.start as usize,
-        anchor_range.end as usize,
-    );
+    let selected_source = get_lines(source, input.lines.start as usize, input.lines.end as usize);
 
     DecisionRecord {
         id: id.into(),
-        lines_hint: anchor_range,
+        lines_hint: input.lines.clone(),
         fingerprint: fingerprint(&selected_source),
         chose: input.chose.clone(),
         because: input.because.clone(),
@@ -823,6 +800,34 @@ mod tests {
         assert_eq!(record.status, None);
         assert_eq!(record.stale_since, None);
         assert_eq!(record.supersedes, None);
+    }
+
+    #[test]
+    fn build_decision_record_preserves_input_line_range() {
+        let source = "function kept() {\n  return 1;\n}\n";
+        let input = WriteDecisionInput {
+            file: RelativePath::new("src/body.ts").unwrap(),
+            anchor: "fn:kept".to_string(),
+            lines: LineRange { start: 2, end: 2 },
+            chose: "body line".to_string(),
+            because: "caller selected the body".to_string(),
+            rejected: Vec::new(),
+            expires_if: None,
+            supersedes: None,
+            session: None,
+        };
+
+        let record = build_decision_record(
+            &input,
+            "dec_001",
+            source,
+            "2026-06-26T20:31:18.340Z",
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(record.lines_hint, LineRange { start: 2, end: 2 });
+        assert_eq!(record.fingerprint, fingerprint(&get_lines(source, 2, 2)));
     }
 
     #[test]

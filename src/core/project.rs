@@ -355,23 +355,22 @@ pub fn post_tool_use(project_root: &Path, file: &RelativePath) -> Result<String>
             let mut orphan = 0_usize;
             for (anchor, decision) in dlog.decisions.iter_mut() {
                 let anchor_exists = if let Some(info) = extraction.anchors.get_str(anchor) {
-                    // The anchor still resolves in the freshly-extracted source,
-                    // so the extractor's live position is ground truth. Use it
-                    // directly to keep re-anchoring idempotent: a second run
-                    // re-derives the same range and leaves lines_hint/STALE
-                    // unchanged. Diff-shifting a still-resolving anchor (the old
-                    // behavior) drifts the range across repeated edits and marks
-                    // moved-but-unchanged code falsely STALE.
-                    //
-                    // The fingerprint is intentionally NOT recomputed here: it is
-                    // the staleness oracle (content hash captured at decision
-                    // time). is_fingerprint_stale compares the source at this
-                    // corrected position against that stored hash, so a semantic
-                    // change is still detected while a pure line shift is not.
-                    decision.lines_hint = LineRange {
-                        start: info.start,
-                        end: info.end,
-                    };
+                    if moved_from.is_some() {
+                        // Local rename recovery has no TypeScript equivalent and no
+                        // reliable same-path Git baseline. Once the matching dlog has
+                        // been moved, the extractor range is the only useful position
+                        // evidence for surviving anchors.
+                        decision.lines_hint = LineRange {
+                            start: info.start,
+                            end: info.end,
+                        };
+                    } else {
+                        // Preserve TypeScript postToolUse behavior for same-file
+                        // edits: keep the stored decision span shape and shift it by
+                        // the Git-head line diff before fingerprint checks.
+                        decision.lines_hint =
+                            apply_line_changes_to_range(&line_changes, decision.lines_hint.clone());
+                    }
                     true
                 } else {
                     // Orphaned anchor: it no longer resolves, so there is no
@@ -1712,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn post_tool_use_reanchors_to_live_position_without_git_baseline() {
+    fn post_tool_use_uses_empty_diff_without_git_baseline() {
         let root = unique_temp_dir("archiva-project-post-shift-no-git");
         let source_path = root.join("src").join("shift.ts");
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -1733,40 +1732,38 @@ mod tests {
         .unwrap();
         let file = RelativePath::new("src/shift.ts").unwrap();
 
-        // A comment was inserted above the function: its body is byte-identical
-        // but it now lives at lines 2-4. Even without a git baseline to diff
-        // against, the extractor resolves fn:kept at its live position, so we
-        // re-anchor there. The fingerprint at the corrected range matches the
-        // stored hash, so the unchanged function is NOT falsely marked STALE.
+        // TypeScript postToolUse falls back to the current content as the Git
+        // baseline when no committed version is available. That produces an
+        // empty diff, so the stored range is not live-recovered for same-file
+        // edits and the fingerprint check marks it stale.
         assert_eq!(
             post_tool_use(&root, &file).unwrap(),
-            "Re-anchored src/shift.ts: 0 stale, 0 orphan."
+            "Re-anchored src/shift.ts: 1 stale, 0 orphan."
         );
         let stored = load_dlog(&root, &file).unwrap().unwrap();
         let decision = stored.decisions.get_str("fn:kept").unwrap();
-        assert_eq!(decision.lines_hint, LineRange { start: 2, end: 4 });
-        assert_eq!(decision.status, None);
+        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 3 });
+        assert_eq!(decision.status, Some(DecisionStatus::Stale));
         assert_eq!(
             fs::read_to_string(dmap_path(&root, &file)).unwrap(),
-            "2-4:fn:kept\n"
+            "1-3:fn:kept:STALE\n"
         );
 
-        // Re-anchoring is idempotent: a second run leaves range and status
-        // unchanged.
+        // The empty diff is stable across repeated same-file runs.
         assert_eq!(
             post_tool_use(&root, &file).unwrap(),
-            "Re-anchored src/shift.ts: 0 stale, 0 orphan."
+            "Re-anchored src/shift.ts: 1 stale, 0 orphan."
         );
         let stored_again = load_dlog(&root, &file).unwrap().unwrap();
         let decision_again = stored_again.decisions.get_str("fn:kept").unwrap();
-        assert_eq!(decision_again.lines_hint, LineRange { start: 2, end: 4 });
-        assert_eq!(decision_again.status, None);
+        assert_eq!(decision_again.lines_hint, LineRange { start: 1, end: 3 });
+        assert_eq!(decision_again.status, Some(DecisionStatus::Stale));
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn post_tool_use_reanchors_to_live_range_when_anchor_body_grows() {
+    fn post_tool_use_keeps_diff_shifted_range_when_anchor_body_grows_without_git() {
         let root = unique_temp_dir("archiva-project-post-range-growth");
         let source_path = root.join("src").join("growth.ts");
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -1787,34 +1784,31 @@ mod tests {
         .unwrap();
         let file = RelativePath::new("src/growth.ts").unwrap();
 
-        // The body genuinely changed and grew to lines 1-4. We re-anchor to the
-        // live range 1-4, and because the content at that range differs from the
-        // stored fingerprint it is correctly marked STALE.
+        // The body changed and grew to lines 1-4, but with no Git baseline the
+        // TypeScript-compatible range update is an empty diff. The stored 1-3
+        // range remains and its fingerprint mismatch marks the decision STALE.
         assert_eq!(
             post_tool_use(&root, &file).unwrap(),
             "Re-anchored src/growth.ts: 1 stale, 0 orphan."
         );
         let stored = load_dlog(&root, &file).unwrap().unwrap();
         let decision = stored.decisions.get_str("fn:kept").unwrap();
-        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 4 });
+        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 3 });
         assert_eq!(decision.status, Some(DecisionStatus::Stale));
         assert_eq!(
             fs::read_to_string(dmap_path(&root, &file)).unwrap(),
-            "1-4:fn:kept:STALE\n"
+            "1-3:fn:kept:STALE\n"
         );
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn write_decision_snaps_range_to_anchor_span_and_avoids_false_stale() {
-        // Regression for the false-STALE bug: a caller records a range that
-        // differs from the anchor's extractor span (here a body-only [2, 3]
-        // where fn:kept spans 1-3). The old write path stored `input.lines`
-        // verbatim and fingerprinted that range, but `post_tool_use` re-anchors
-        // to the extractor span [1, 3] — so the first re-anchor of *unchanged*
-        // code recomputed the fingerprint over a different range and falsely
-        // marked the decision STALE, then lint demanded a supersede.
+    fn write_decision_preserves_caller_range_and_avoids_false_stale() {
+        // TypeScript writeDecision stores the caller-provided range verbatim.
+        // Because same-file post_tool_use also diff-shifts the stored range
+        // instead of snapping to the live extractor span, an unchanged body-only
+        // range remains self-consistent and does not become falsely stale.
         let root = unique_temp_dir("archiva-project-false-stale");
         let source_path = root.join("src").join("k.ts");
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -1834,8 +1828,7 @@ mod tests {
             "2026-06-26T20:31:18.341Z",
         )
         .unwrap();
-        // Write time already snaps to the extractor span for both fields.
-        assert_eq!(record.lines_hint, LineRange { start: 1, end: 3 });
+        assert_eq!(record.lines_hint, LineRange { start: 2, end: 3 });
 
         let file = RelativePath::new("src/k.ts").unwrap();
         // Re-anchoring unchanged code must report 0 stale, twice (idempotent).
@@ -1849,7 +1842,7 @@ mod tests {
         );
         let stored = load_dlog(&root, &file).unwrap().unwrap();
         let decision = stored.decisions.get_str("fn:kept").unwrap();
-        assert_eq!(decision.lines_hint, LineRange { start: 1, end: 3 });
+        assert_eq!(decision.lines_hint, LineRange { start: 2, end: 3 });
         assert_eq!(decision.status, None);
 
         let _ = fs::remove_dir_all(root);
