@@ -4008,6 +4008,7 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
+            #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
         }
         fs::set_permissions(path, permissions).unwrap();
