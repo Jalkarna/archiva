@@ -7,10 +7,10 @@ use crate::core::ordered_map::OrderedMap;
 use crate::core::paths::RelativePath;
 
 /// Maximum nesting depth the recursive Rust extractor will descend before it
-/// stops and marks the extraction truncated. Measured frame cost is ~600 B, so
-/// 256 levels (~150 KiB) is safe even on a 1 MiB main-thread stack (Windows)
-/// while being far above any plausible hand-written source nesting.
-const MAX_RUST_NESTING_DEPTH: usize = 256;
+/// stops and marks the extraction truncated. The limit stays deliberately below
+/// the Windows CI small-stack guard while remaining far above plausible
+/// hand-written source nesting.
+const MAX_RUST_NESTING_DEPTH: usize = 96;
 
 /// Maximum nesting depth the recursive JavaScript/TypeScript/C-family scanners
 /// (template-literal interpolation, `if`/`else` statement bodies, and the
@@ -19,9 +19,9 @@ const MAX_RUST_NESTING_DEPTH: usize = 256;
 /// otherwise-unbounded mutual recursion whose overflow is an uncatchable
 /// *abort* (deeply nested `` `${`${…}`}` `` or `else if` chains in a committed
 /// source file would take down `status`/`lint` and the long-lived MCP server).
-/// The bound is far above any plausible hand-written nesting yet safe even on a
-/// 1 MiB main-thread stack.
-const MAX_SOURCE_NESTING_DEPTH: usize = 256;
+/// The bound is intentionally shared across platforms so the same pathological
+/// source is treated conservatively everywhere.
+const MAX_SOURCE_NESTING_DEPTH: usize = 96;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnchorKind {
@@ -851,9 +851,9 @@ fn collect_rust_item_anchors(
     // nested input (e.g. thousands of `{`) would otherwise recurse once per
     // level and overflow the stack — an *abort* that no panic boundary can
     // catch, taking down `status`/`lint` and the long-lived MCP server. The
-    // bound is far above any realistic source nesting yet safe even on a 1 MiB
-    // main-thread stack (Windows). Hitting it marks the extraction truncated so
-    // it is reported incomplete rather than silently partial.
+    // bound is far above any realistic source nesting and below the Windows CI
+    // small-stack guard. Hitting it marks the extraction truncated so it is
+    // reported incomplete rather than silently partial.
     if builder.rust_item_depth >= MAX_RUST_NESTING_DEPTH {
         builder.truncated = true;
         return;
