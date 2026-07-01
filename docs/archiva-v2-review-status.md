@@ -1,27 +1,30 @@
 # Archiva v2 Review Status
 
-Status: current review record, updated 2026-06-30.
+Status: current review record, updated 2026-07-02.
 
 ## Current Evidence
 
-The Rust implementation is present and is the package entrypoint. Current local evidence from this workspace:
+The Rust implementation is present and is the package entrypoint. Current evidence from this workspace and GitHub:
 
-- `npm run check`: passed, including `cargo fmt --check`, clippy with `-D warnings`, 301 passing Rust tests, 1 ignored Rust test, 9 integration tests, 1 doc-style test, native package metadata validation, and the v2 completion audit.
-- `npm test`: passed, 108 Vitest tests across 7 files, including `audit:v2` regression coverage for strict completion, script drift, silent workflow artifact producers, nested and ambiguous evidence artifacts, and C/C++ artifact semantics.
-- `cargo test --quiet core::git`: passed, 42 tests, including SHA-256 loose, packed, and linked-worktree coverage.
+- Rust implementation validation commit `dabe3923a48f41ca1d09b624c9353b733c83e4ac` is pushed on PR #3.
+- GitHub CI run `28549540760`: passed on Linux, macOS, and Windows Rust jobs; all seven native package build/smoke jobs; robustness gates; and the main test job.
+- Heavy validation run `28549550140`: passed with uploaded JSON artifacts for differential, stress soak, benchmark comparison, synthetic scale smoke, seeded scale, external TypeScript corpus scale, and Rust self-corpus scale.
+- Long-horizon corpus run `28551553784`: all ten corpus jobs passed and uploaded JSON artifacts for Rust compiler, Cargo, ripgrep, Tokio, Linux kernel, LLVM, TypeScript, Node, React, and Next.
+- `npm run --silent audit:v2 -- --evidence-dir /tmp/archiva-evidence-combined-28551553784 --json`: passed 60 checks with 0 failures against the combined heavy-validation and long-horizon artifact bundle.
+- `npm run check`: passed, including TypeScript compile, `cargo fmt --check`, clippy with `-D warnings`, Rust tests, native package metadata validation, and the v2 completion audit.
+- `cargo test --all-targets --locked --quiet`: passed, including 318 Rust unit tests, 1 ignored Rust test, and all integration suites.
+- `cargo clippy --all-targets --locked -- -D warnings`: passed.
+- `cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings`: passed.
 - `npm run build`: passed, including release Rust build, native package staging, TypeScript build, and native bin shim generation.
-- `npm run differential:release`: passed, including `post-tool-use-sha256-git` and all compatibility/improvement scenarios.
+- `npm run differential:release`: passed, 56 scenarios, 0 failures.
 - `npm run property:soak`: passed the ignored extended serialization/diff property test.
-- `npm run stress:soak`: passed, 30 cycles across 10 files / 6 functions.
-- `npm run smoke:package`: passed with staged `linux-x64-gnu` native tarball, installed TypeScript and Rust CLI behavior, git-backed reanchor, clean status/lint, MCP `tools/list`, and MCP `ghost_check`.
-- `npm run scale:smoke`: passed with 512-file Rust scale, measured RSS, and TypeScript-vs-Rust command-summary plus decision artifact parity.
-- `npm run scale:corpus:rust` against `src/`: passed with bounded 40-file / 24-decision / 16-mutation self-corpus settings, corpus semantic checks, shifted/stale mutation evidence, and mixed Rust anchor coverage.
-- Forced C/C++ `npm run scale:corpus` against a temporary C/C++ corpus: passed with native-only corpus validation, shifted/stale mutation evidence, and mixed C/C++ anchor-kind coverage.
-- `npm run benchmark:compare`: passed within configured runtime and RSS thresholds; measured Rust peak RSS was 2816 KiB and all benchmark ratios were within gate.
-- `npm run audit:v2`: passed 36 local evidence checks; `npm run --silent audit:v2 -- --evidence-dir <synthetic bundle>` passed the artifact-bundle validation path.
-- `git diff --check`: passed.
+- `npm run stress:soak`: passed, 30 cycles across 10 files / 6 functions, 0 failures.
+- `npm run scale:smoke`: passed with 512-file Rust scale and TypeScript-vs-Rust parity artifacts.
+- `npm run scale:corpus` against the pinned TypeScript compiler corpus: passed with 80 selected files, 30 decision writes, and byte-matched TypeScript/Rust decision artifacts.
+- `npm run scale:corpus:rust` against `src/`: passed with 31 selected Rust files, 24 decision writes, and mixed Rust anchor-kind coverage.
+- `npm run benchmark:compare`: passed within configured runtime and RSS thresholds; heavy-validation measured Rust peak RSS under 3 MiB and all benchmark ratios were within gate.
 - `cargo run --quiet -- lint`: passed.
-- `cargo run --quiet -- status`: 537 decisions, 0 stale, 0 orphan, 0 issues.
+- `cargo run --quiet -- status`: 594 decisions, 0 stale, 0 orphan, 0 issues.
 
 ## Independent Review Findings Addressed
 
@@ -46,18 +49,17 @@ Recent reviewer findings and dispositions:
 - Musl post-publish smoke only checked version output.
   - Disposition: the Alpine musl post-publish job now exercises init, write-decision, why, status, lint, and MCP with the installed published native binary.
 
-## Remaining Local Gaps
+## External Evidence Status
 
-- Final release completion still needs `audit:v2 --evidence-dir` against fresh CI, long-horizon, publish, and post-publish artifacts from the release commit.
+The previously missing external validation evidence is now archived for this commit:
 
-## External Evidence Still Required
+- macOS and Windows Rust build/test results: proven by CI run `28549540760`.
+- Linux arm64 and musl native package build/smoke results: proven by CI run `28549540760`.
+- full heavy-validation workflow artifacts: proven by Heavy validation run `28549550140`.
+- scheduled or manually triggered long-horizon corpus artifacts: proven by long-horizon jobs in run `28551553784`.
 
-These cannot be proven from this Linux workspace alone:
+## Remaining Release Evidence
 
-- macOS and Windows Rust build/test results from GitHub-hosted runners;
-- Linux arm64 and musl native package build/smoke results;
-- full heavy-validation workflow artifacts;
-- scheduled or manually triggered long-horizon corpus artifacts;
-- npm publish and post-publish install smoke artifacts.
+- npm publish and post-publish install smoke artifacts still require a real release/tagged publish workflow run.
 
-Until those artifacts exist and pass, the v2 objective remains active rather than complete.
+Until publish and post-publish artifacts exist and pass, the release v2 objective remains active rather than complete.

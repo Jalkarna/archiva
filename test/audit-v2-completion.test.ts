@@ -93,7 +93,8 @@ describe("v2 completion audit", () => {
     expect(result.status).toBe(1);
     const output = parseAuditOutput(result.stdout);
     expect(output.status).toBe("failed");
-    expect(output.externalEvidenceStillRequired).toContain("scheduled or manually triggered long-horizon corpus artifacts");
+    expect(output.externalEvidenceArchived).toContain("scheduled or manually triggered long-horizon corpus artifacts");
+    expect(output.externalEvidenceStillRequired).toEqual(["npm publish and post-publish install smoke artifacts"]);
   });
 
   it("fails when a release soak script is weakened", async () => {
@@ -297,6 +298,7 @@ function runAudit(args: string[], env: Record<string, string> = {}) {
 function parseAuditOutput(stdout: string): {
   status: "passed" | "failed";
   localChecks: Array<{ name: string; passed: boolean }>;
+  externalEvidenceArchived: string[];
   externalEvidenceStillRequired: string[];
 } {
   return JSON.parse(stdout);

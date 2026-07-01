@@ -449,12 +449,13 @@ raising confidence beyond the normal publish gate.
 
 `audit:v2` checks that the local repository still exposes the required Rust
 crate, zero-runtime-dependency package surface, exact validation script wiring,
-CLI/MCP behavior surface, long-horizon evidence producers, and explicit
-external evidence gaps. With `--evidence-dir <dir>`, it also validates collected
-heavy-validation and long-horizon JSON artifacts; this can point directly at a
-directory produced by `gh run download --dir <dir>`. It is an honesty gate: it
-passes when local evidence is internally consistent and still refuses to claim
-completion until CI, long-horizon, publish, and post-publish artifacts exist.
+CLI/MCP behavior surface, long-horizon evidence producers, archived external
+validation evidence, and remaining release evidence. With
+`--evidence-dir <dir>`, it also validates collected heavy-validation and
+long-horizon JSON artifacts; this can point directly at a directory produced by
+`gh run download --dir <dir>`. It is an honesty gate: it passes when local and
+artifact evidence are internally consistent, and it still refuses strict
+completion until publish and post-publish smoke artifacts exist.
 
 `scale:corpus` copies a bounded subset of real source files into temporary
 projects, writes decisions, mutates files, runs hooks, lint, status,

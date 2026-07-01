@@ -1,6 +1,6 @@
 # Archiva v2 Rust Architecture
 
-Status: current implementation record, updated 2026-06-30.
+Status: current implementation record, updated 2026-07-02.
 
 Archiva v2 is a std-only Rust re-engineering of the TypeScript Archiva behavior. The TypeScript codebase remains the behavioral oracle for compatibility unless a divergence is documented as an intentional hardening improvement and covered by differential tests.
 
@@ -131,5 +131,5 @@ The implementation keeps extension points local and std-only:
 
 ## Remaining Architecture Gaps
 
-- Execute and archive real GitHub-hosted macOS, Windows, ARM, musl, heavy-validation, and long-horizon workflow results.
-- Keep this document and `docs/archiva-v2-review-status.md` current with final CI artifacts before declaring v2 complete.
+- Release publication evidence is still outstanding: npm publish and post-publish install smoke artifacts require a real release/tagged publish workflow run.
+- Keep this document and `docs/archiva-v2-review-status.md` current with final release artifacts before declaring the published release complete.

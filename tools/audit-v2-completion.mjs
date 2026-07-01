@@ -93,11 +93,14 @@ const nativeTargets = [
   "win32-x64-msvc"
 ];
 
-const externalEvidenceNeedles = [
+const archivedEvidenceNeedles = [
   "macOS and Windows Rust build/test results",
   "Linux arm64 and musl native package build/smoke results",
   "full heavy-validation workflow artifacts",
-  "scheduled or manually triggered long-horizon corpus artifacts",
+  "scheduled or manually triggered long-horizon corpus artifacts"
+];
+
+const remainingReleaseEvidenceNeedles = [
   "npm publish and post-publish install smoke artifacts"
 ];
 
@@ -261,8 +264,9 @@ async function auditDocumentationHonesty() {
   const readme = await readText("README.md");
 
   assertCheck("architecture document exists and covers future extension points", "docs/archiva-v2-architecture.md", architecture.includes("## Future Extension Points"));
-  assertCheck("review status keeps v2 goal active until external artifacts pass", "docs/archiva-v2-review-status.md", review.includes("v2 objective remains active rather than complete"));
-  assertCheck("review status lists all external evidence gaps", "docs/archiva-v2-review-status.md", includesAll(review, externalEvidenceNeedles));
+  assertCheck("review status keeps release goal active until publish artifacts pass", "docs/archiva-v2-review-status.md", review.includes("release v2 objective remains active rather than complete"));
+  assertCheck("review status lists archived external validation evidence", "docs/archiva-v2-review-status.md", includesAll(review, archivedEvidenceNeedles));
+  assertCheck("review status lists remaining release evidence", "docs/archiva-v2-review-status.md", includesAll(review, remainingReleaseEvidenceNeedles));
   assertCheck("README links v2 architecture and review status", "README.md", includesAll(readme, ["docs/archiva-v2-architecture.md", "docs/archiva-v2-review-status.md"]));
   assertCheck("README heavy-validation commands include release stress soak", "README.md", readme.includes("npm run stress:soak"));
 }
@@ -327,9 +331,9 @@ function printHuman() {
     process.exitCode = 1;
     return;
   }
-  console.log(`Archiva v2 completion audit OK (${checks.length} local evidence checks). External completion evidence is still required before marking v2 complete.`);
+  console.log(`Archiva v2 completion audit OK (${checks.length} local evidence checks). Release publish and post-publish evidence is still required before marking the published release complete.`);
   if (hasStrictComplete) {
-    console.error("Strict completion mode failed: external CI, long-horizon, publish, and post-publish evidence is intentionally still required.");
+    console.error("Strict completion mode failed: publish and post-publish evidence is intentionally still required.");
     process.exitCode = 1;
   }
 }
@@ -352,7 +356,8 @@ async function main() {
           status: failed.length === 0 && !hasStrictComplete ? "passed" : "failed",
           localChecks: checks,
           evidenceDir: evidenceDir ?? null,
-          externalEvidenceStillRequired: externalEvidenceNeedles
+          externalEvidenceArchived: archivedEvidenceNeedles,
+          externalEvidenceStillRequired: remainingReleaseEvidenceNeedles
         },
         null,
         2
