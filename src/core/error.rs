@@ -55,6 +55,12 @@ pub enum ArchivaError {
     Dmap {
         message: String,
     },
+    /// Wraps another error with the file it came from, so parse/schema/IO
+    /// failures on committed data name the offending file (audit blocker B5).
+    Contextualized {
+        path: PathBuf,
+        source: Box<ArchivaError>,
+    },
 }
 
 impl ArchivaError {
@@ -76,6 +82,41 @@ impl ArchivaError {
         Self::Schema {
             field: field.into(),
             message: message.into(),
+        }
+    }
+
+    /// Attach the originating file to an error so whole-repo commands can point
+    /// operators at the exact corrupt file. Idempotent-ish: re-wrapping keeps
+    /// the innermost (first-attached) path, since that is the concrete file.
+    pub fn with_path(self, path: impl Into<PathBuf>) -> Self {
+        match self {
+            Self::Contextualized { .. } => self,
+            other => Self::Contextualized {
+                path: path.into(),
+                source: Box::new(other),
+            },
+        }
+    }
+
+    /// The file this error was attributed to, if any.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Contextualized { path, .. } => Some(path.as_path()),
+            _ => None,
+        }
+    }
+
+    /// True when this error reflects corrupt *committed data* (a malformed
+    /// `.dlog`/`.dmap`: bad YAML/JSON, a schema violation, or a dmap parse
+    /// failure) rather than an environmental/IO problem. Whole-repo commands
+    /// skip-and-report these per file instead of aborting (audit blocker B5);
+    /// genuine IO errors still propagate because they usually indicate a
+    /// systemic problem, not one bad file.
+    pub fn is_corrupt_data(&self) -> bool {
+        match self {
+            Self::Yaml { .. } | Self::Json { .. } | Self::Schema { .. } | Self::Dmap { .. } => true,
+            Self::Contextualized { source, .. } => source.is_corrupt_data(),
+            _ => false,
         }
     }
 
@@ -106,6 +147,9 @@ impl ArchivaError {
             | Self::Git { message }
             | Self::Dmap { message } => message.clone(),
             Self::Mcp { message, .. } => message.clone(),
+            Self::Contextualized { path, source } => {
+                format!("{}: {}", path.display(), source.user_message())
+            }
         }
     }
 }
@@ -120,6 +164,7 @@ impl Error for ArchivaError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::Contextualized { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }

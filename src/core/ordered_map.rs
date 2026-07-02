@@ -39,6 +39,15 @@ where
         self.entries.push((key, value));
     }
 
+    /// Append an entry whose key the caller guarantees is not already present,
+    /// skipping the linear duplicate scan `insert` performs. Using this in a
+    /// per-item build loop keeps construction O(n) instead of O(n²); passing a
+    /// key that already exists silently creates a shadowed duplicate, so only
+    /// use it when uniqueness is established by construction.
+    pub fn push_unique(&mut self, key: K, value: V) {
+        self.entries.push((key, value));
+    }
+
     pub fn get(&self, key: &K) -> Option<&V> {
         self.entries
             .iter()

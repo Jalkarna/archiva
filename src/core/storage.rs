@@ -6,12 +6,14 @@ use crate::core::decision::{
     apply_decision_record, build_decision_record, next_decision_id, prepare_supersede,
     WriteDecisionInput,
 };
-use crate::core::dlog::{parse_dlog_yaml, render_dlog_yaml, DlogFile};
+use crate::core::dlog::{parse_dlog_yaml, render_dlog_yaml, validate_dlog_for_write, DlogFile};
 use crate::core::dmap::{parse_dmap, render_dmap, DmapEntry};
 use crate::core::error::{ArchivaError, Result};
 use crate::core::fs::{acquire_file_lock, atomic_write_text, read_text_if_exists};
 use crate::core::ordered_map::OrderedMap;
-use crate::core::paths::{decision_lock_path, dlog_path, dmap_path, RelativePath};
+use crate::core::paths::{
+    assert_decision_path_contained, decision_lock_path, dlog_path, dmap_path, RelativePath,
+};
 use crate::core::time::now_utc_millis;
 use crate::core::version::DLOG_SCHEMA_VERSION;
 
@@ -24,10 +26,13 @@ pub fn create_empty_dlog(file: RelativePath) -> DlogFile {
 }
 
 pub fn load_dlog(project_root: &Path, file: &RelativePath) -> Result<Option<DlogFile>> {
-    let Some(content) = read_text_if_exists(&dlog_path(project_root, file))? else {
+    let path = dlog_path(project_root, file);
+    let Some(content) = read_text_if_exists(&path)? else {
         return Ok(None);
     };
-    let mut dlog = parse_dlog_yaml(&content)?;
+    // Attach the concrete file to any parse/schema error so whole-repo commands
+    // can name the corrupt file (audit blocker B5).
+    let mut dlog = parse_dlog_yaml(&content).map_err(|error| error.with_path(&path))?;
     dlog.file = file.clone();
     Ok(Some(dlog))
 }
@@ -125,20 +130,66 @@ pub fn ensure_dmap_current_locked(project_root: &Path, dlog: &DlogFile) -> Resul
         Ok(_) | Err(ArchivaError::FileTooLarge { .. }) => {}
         Err(error) => return Err(error),
     }
+    // The on-disk .dmap was missing, stale, or corrupt; it is being rebuilt
+    // from the authoritative .dlog. Previously silent (audit blocker B9).
+    crate::diag!(
+        crate::core::diagnostics::Level::Info,
+        "repairing .dmap index for {} from its .dlog",
+        dlog.file.as_str()
+    );
     write_dmap(project_root, dlog)
 }
 
 pub fn write_dlog(project_root: &Path, dlog: &DlogFile) -> Result<()> {
+    // Enforce domain invariants (e.g. schema version) directly on the struct —
+    // cheap and always on.
+    validate_dlog_for_write(dlog)?;
+    // Reject a symlink escape on the write path (audit blocker B7) before
+    // rendering or touching the filesystem.
+    assert_decision_path_contained(project_root, &dlog.file)?;
     let rendered = render_dlog_yaml(dlog)?;
+    // Additionally verify the rendered YAML round-trips, but only in debug/test
+    // builds. This guards against a renderer bug producing unparseable output;
+    // the property tests (`property_yaml_roundtrips_rendered_values`) cover it
+    // broadly. In release this re-parse was unconditional wasted work on the
+    // write hot path (audit blocker B8): it made every decision write re-parse
+    // the whole file it just rendered, an O(file) tax on top of the rewrite.
+    #[cfg(debug_assertions)]
     parse_dlog_yaml(&rendered)?;
     atomic_write_text(&dlog_path(project_root, &dlog.file), &rendered)
 }
 
 pub fn write_dmap(project_root: &Path, dlog: &DlogFile) -> Result<()> {
+    // Reject a symlink escape on the write path (audit blocker B7).
+    assert_decision_path_contained(project_root, &dlog.file)?;
     atomic_write_text(
         &dmap_path(project_root, &dlog.file),
         &render_dmap_from_dlog(dlog),
     )
+}
+
+/// Write the `.dmap` after the `.dlog` has already been durably committed.
+///
+/// The `.dmap` is a derivative index that every read path rebuilds from the
+/// `.dlog` when it is missing, stale, or corrupt (see `load_dmap` /
+/// `ensure_dmap_current`). So once the `.dlog` write succeeds, a failure to
+/// write the `.dmap` is *not* a failed decision: the decision is committed and
+/// reads will self-heal the index. Propagating that failure was audit blocker
+/// B6 — it reported the write as failed (exit 1) even though the `.dlog` was
+/// durably written, and the natural retry then allocated a fresh decision id,
+/// losing the original reasoning with no history entry.
+///
+/// We therefore downgrade a post-`.dlog` `.dmap` write failure to a logged
+/// warning and report overall success.
+fn write_dmap_after_dlog(project_root: &Path, dlog: &DlogFile) {
+    if let Err(error) = write_dmap(project_root, dlog) {
+        crate::diag!(
+            crate::core::diagnostics::Level::Warn,
+            "decision committed to {} but the .dmap index write failed ({}); it will be rebuilt on next read",
+            dlog.file.as_str(),
+            error.user_message()
+        );
+    }
 }
 
 pub fn move_dlog_and_dmap_locked(
@@ -188,6 +239,10 @@ pub fn with_decision_file_lock<T>(
     timestamp: &str,
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    // Reject a symlink escape before creating the lock file (audit blocker B7):
+    // the lock lives next to the .dlog/.dmap under .decisions/, so a symlinked
+    // directory component would place it outside the repo too.
+    assert_decision_path_contained(project_root, file)?;
     let lock_path = decision_lock_path(project_root, file);
     let lock = acquire_file_lock(&lock_path, command, timestamp)?;
     let output = action()?;
@@ -234,6 +289,8 @@ pub fn write_decision_record_locked(
     env_session: Option<&str>,
     lock_timestamp: &str,
 ) -> Result<crate::core::dlog::DecisionRecord> {
+    // Reject a symlink escape before creating the lock file (audit blocker B7).
+    assert_decision_path_contained(project_root, &input.file)?;
     let lock_path = decision_lock_path(project_root, &input.file);
     let lock = acquire_file_lock(&lock_path, "write-decision", lock_timestamp)?;
     let mut dlog = load_or_create_dlog(project_root, input.file.clone())?;
@@ -244,6 +301,35 @@ pub fn write_decision_record_locked(
         .map(|plan| plan.history.clone())
         .unwrap_or_default();
     let superseded_anchor = supersede.as_ref().map(|plan| plan.anchor.as_str());
+
+    // Refuse to silently overwrite an existing decision (audit blocker B11).
+    // apply_decision_record inserts at `input.anchor`, replacing whatever lives
+    // there. That is only safe when this write intentionally supersedes the
+    // decision currently at that anchor (its reasoning is then preserved in the
+    // new record's history). Otherwise — a plain re-decide without `supersedes`,
+    // or a supersede of some *other* anchor landing on an occupied one — the
+    // existing decision's chose/because/rejected/history would be lost with no
+    // trace. Require an explicit supersede instead.
+    if let Some(existing) = dlog.decisions.get_str(&input.anchor) {
+        let is_inplace_supersede = superseded_anchor == Some(input.anchor.as_str());
+        if !is_inplace_supersede {
+            crate::diag!(
+                crate::core::diagnostics::Level::Warn,
+                "refused to overwrite decision {} at {} in {} without supersedes",
+                existing.id,
+                input.anchor,
+                input.file.as_str()
+            );
+            return Err(ArchivaError::cli(format!(
+                "A decision already exists for {} in {} (id {}). Superseding it requires supersedes=\"{}\" (run `why` to confirm the id); writing without it would discard the recorded reasoning and history.",
+                input.anchor,
+                input.file.as_str(),
+                existing.id,
+                existing.id,
+            )));
+        }
+    }
+
     let decision =
         build_decision_record(input, id, source, decision_timestamp, env_session, history);
 
@@ -254,7 +340,9 @@ pub fn write_decision_record_locked(
         superseded_anchor,
     );
     write_dlog(project_root, &dlog)?;
-    write_dmap(project_root, &dlog)?;
+    // The decision is durable once the .dlog is written; a .dmap write failure
+    // is a warning, not a failed decision (audit blocker B6).
+    write_dmap_after_dlog(project_root, &dlog);
     lock.release()?;
 
     Ok(decision)
@@ -278,6 +366,31 @@ mod tests {
     use crate::core::{decision::WriteDecisionInput, dlog::RejectedAlternative};
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    #[cfg(unix)]
+    fn write_refuses_symlinked_decisions_dir_that_escapes_project_root() {
+        // Audit blocker B7: a checked-in symlink at a directory component under
+        // .decisions/ must not let a decision write escape the project root.
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("archiva-storage-b7-symlink");
+        let outside = unique_temp_dir("archiva-storage-b7-outside");
+        fs::create_dir_all(root.join(".decisions")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        // .decisions/src -> /outside : a write to src/... would land outside.
+        symlink(&outside, root.join(".decisions").join("src")).unwrap();
+
+        let dlog = create_empty_dlog(RelativePath::new("src/escape.ts").unwrap());
+        let error = write_dlog(&root, &dlog).unwrap_err().user_message();
+        assert!(error.contains("outside the project root"), "{error}");
+
+        // Nothing was written into the escape target.
+        assert!(!outside.join("escape.ts.dlog").exists());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
 
     #[test]
     fn creates_empty_dlog_and_loads_missing_files_like_typescript_storage() {
@@ -567,10 +680,188 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["fn:second"]
         );
+        // TypeScript writeDecision preserves the caller-provided range, so the
+        // superseding record keeps the fixture's placeholder `[1, 3]` range even
+        // though fn:second resolves later in the file.
+        assert_eq!(second_decision.lines_hint, LineRange { start: 1, end: 3 });
         assert_eq!(
             fs::read_to_string(dmap_path(&root, &second.file)).unwrap(),
             "1-3:fn:second\n"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refuses_to_overwrite_existing_decision_without_supersede() {
+        // Audit blocker B11: writing a new decision to an anchor that already
+        // holds one, without superseding it, must be refused rather than
+        // silently discarding the recorded reasoning and history.
+        let root = unique_temp_dir("archiva-storage-b11-no-overwrite");
+        let source = "function target() {\n  return 1;\n}\n";
+        let first = write_input("src/b11.ts", "fn:target", None);
+        let first_decision = write_decision_record_locked(
+            &root,
+            &first,
+            source,
+            "2026-06-26T20:31:18.340Z",
+            None,
+            "2026-06-26T20:31:18.341Z",
+        )
+        .unwrap();
+        assert_eq!(first_decision.id, "dec_001");
+
+        // A second write to the same anchor without `supersedes` is refused.
+        let clobber = write_input("src/b11.ts", "fn:target", None);
+        let error = write_decision_record_locked(
+            &root,
+            &clobber,
+            source,
+            "2026-06-26T20:32:18.340Z",
+            None,
+            "2026-06-26T20:32:18.341Z",
+        )
+        .unwrap_err()
+        .user_message();
+        assert!(error.contains("already exists"), "{error}");
+        assert!(error.contains("dec_001"), "{error}");
+        assert!(error.contains("supersedes"), "{error}");
+
+        // The original decision and its reasoning survive untouched, and the
+        // lock is released.
+        let dlog = load_dlog(&root, &first.file).unwrap().unwrap();
+        let stored = dlog.decisions.get_str("fn:target").unwrap();
+        assert_eq!(stored.id, "dec_001");
+        assert_eq!(stored.chose, first_decision.chose);
+        assert!(!decision_lock_path(&root, &first.file).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn allows_in_place_supersede_of_existing_decision() {
+        // The counterpart to B11: an explicit in-place supersede (supersedes
+        // the id living at the same anchor) is allowed and chains history.
+        let root = unique_temp_dir("archiva-storage-b11-inplace-supersede");
+        let source = "function target() {\n  return 1;\n}\n";
+        let first = write_input("src/b11b.ts", "fn:target", None);
+        let first_decision = write_decision_record_locked(
+            &root,
+            &first,
+            source,
+            "2026-06-26T20:31:18.340Z",
+            None,
+            "2026-06-26T20:31:18.341Z",
+        )
+        .unwrap();
+
+        let supersede = write_input("src/b11b.ts", "fn:target", Some(first_decision.id.as_str()));
+        let second_decision = write_decision_record_locked(
+            &root,
+            &supersede,
+            source,
+            "2026-06-26T20:32:18.340Z",
+            None,
+            "2026-06-26T20:32:18.341Z",
+        )
+        .unwrap();
+
+        assert_eq!(second_decision.id, "dec_002");
+        assert_eq!(second_decision.history.len(), 1);
+        assert_eq!(second_decision.history[0].id, "dec_001");
+
+        let dlog = load_dlog(&root, &first.file).unwrap().unwrap();
+        assert_eq!(
+            dlog.decisions
+                .iter()
+                .map(|(anchor, _)| anchor.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fn:target"]
+        );
+        assert_eq!(dlog.decisions.get_str("fn:target").unwrap().id, "dec_002");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refuses_supersede_that_lands_on_a_different_occupied_anchor() {
+        // B11 (supersede-into-occupied variant): superseding decision X (at
+        // anchor A) but writing to a *different* anchor B that already holds an
+        // unrelated decision must be refused — otherwise B's decision would be
+        // silently dropped with no history entry.
+        let root = unique_temp_dir("archiva-storage-b11-cross-anchor");
+        let source = "function first() {\n  return 1;\n}\nfunction second() {\n  return 2;\n}\n";
+        let first = write_decision_record_locked(
+            &root,
+            &write_input("src/x.ts", "fn:first", None),
+            source,
+            "2026-06-26T20:31:18.340Z",
+            None,
+            "2026-06-26T20:31:18.341Z",
+        )
+        .unwrap();
+        write_decision_record_locked(
+            &root,
+            &write_input("src/x.ts", "fn:second", None),
+            source,
+            "2026-06-26T20:32:18.340Z",
+            None,
+            "2026-06-26T20:32:18.341Z",
+        )
+        .unwrap();
+
+        // Supersede fn:first's id, but target the occupied fn:second anchor.
+        let cross = write_input("src/x.ts", "fn:second", Some(first.id.as_str()));
+        let error = write_decision_record_locked(
+            &root,
+            &cross,
+            source,
+            "2026-06-26T20:33:18.340Z",
+            None,
+            "2026-06-26T20:33:18.341Z",
+        )
+        .unwrap_err()
+        .user_message();
+        assert!(error.contains("already exists"), "{error}");
+
+        // Both original decisions survive untouched.
+        let dlog = load_dlog(&root, &RelativePath::new("src/x.ts").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(dlog.decisions.get_str("fn:first").unwrap().id, "dec_001");
+        assert_eq!(dlog.decisions.get_str("fn:second").unwrap().id, "dec_002");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_dlog_rejects_in_memory_records_violating_parser_invariants() {
+        // B8 follow-up: dropping the release-mode render→re-parse must not let a
+        // malformed in-memory record reach disk. validate_dlog_for_write must
+        // reject the same invariants the parser enforces, so a written .dlog
+        // always parses back.
+        let root = unique_temp_dir("archiva-storage-write-validate");
+        let base = fixture_dlog();
+
+        let mut empty_fingerprint = base.clone();
+        if let Some((_, decision)) = empty_fingerprint.decisions.iter_mut().next() {
+            decision.fingerprint = String::new();
+        }
+        let error = write_dlog(&root, &empty_fingerprint)
+            .unwrap_err()
+            .user_message();
+        assert!(error.contains("fingerprint"), "{error}");
+        assert!(error.contains("non-empty"), "{error}");
+
+        let mut zero_range = base.clone();
+        if let Some((_, decision)) = zero_range.decisions.iter_mut().next() {
+            decision.lines_hint = LineRange { start: 0, end: 0 };
+        }
+        let error = write_dlog(&root, &zero_range).unwrap_err().user_message();
+        assert!(error.contains("lines_hint"), "{error}");
+
+        // Nothing was written for the rejected records.
+        assert!(!dlog_path(&root, &base.file).exists());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -661,7 +952,13 @@ mod tests {
 
         let error = load_or_create_dlog(&root, file).unwrap_err().user_message();
 
-        assert_eq!(error, "decisions.fn:bad.lines_hint: missing required field");
+        // B5: the error now names the corrupt file (path prefix) while still
+        // reporting the underlying schema violation.
+        assert!(
+            error.contains("decisions.fn:bad.lines_hint: missing required field"),
+            "{error}"
+        );
+        assert!(error.contains("corrupt.ts.dlog"), "{error}");
         assert!(path.exists());
 
         let _ = fs::remove_dir_all(root);
@@ -774,7 +1071,13 @@ mod tests {
         .unwrap_err()
         .user_message();
 
-        assert_eq!(error, "decisions.fn:bad.lines_hint: missing required field");
+        // B5: the corrupt-dlog error now names the file while preserving the
+        // schema message; the transaction still refuses to overwrite it.
+        assert!(
+            error.contains("decisions.fn:bad.lines_hint: missing required field"),
+            "{error}"
+        );
+        assert!(error.contains("corrupt.ts.dlog"), "{error}");
         assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
         assert!(!dmap_path(&root, &input.file).exists());
         assert!(!decision_lock_path(&root, &input.file).exists());

@@ -10,7 +10,7 @@ use crate::core::error::{ArchivaError, Result};
 use crate::core::time::{now_utc_millis, parse_utc_millis};
 
 const STALE_LOCK_AGE_MILLIS: i128 = 2 * 60 * 1000;
-const LOCK_RETRY_TIMEOUT_MILLIS: u64 = 1_000;
+const LOCK_RETRY_TIMEOUT_MILLIS: u64 = if cfg!(windows) { 5_000 } else { 1_000 };
 const LOCK_RETRY_SLEEP_MILLIS: u64 = 20;
 const LOCK_METADATA_MAX_BYTES: usize = 64 * 1024;
 pub const TEXT_FILE_MAX_BYTES: usize = 10 * 1024 * 1024;
@@ -515,7 +515,16 @@ fn stale_recovery_lock_path(lock_path: &Path) -> PathBuf {
 
 fn remove_stale_lock(lock_path: &Path) -> Result<bool> {
     match fs::remove_file(lock_path) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            // Silent stale-lock takeover was previously invisible (audit
+            // blocker B9); surface it on the diagnostic channel.
+            crate::diag!(
+                crate::core::diagnostics::Level::Info,
+                "recovered stale lock {}",
+                lock_path.display()
+            );
+            Ok(true)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(source) => Err(ArchivaError::io(
             Some(lock_path.to_path_buf()),

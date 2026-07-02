@@ -117,8 +117,16 @@ impl ToolCallHandler for ProjectToolHandler {
             }
             Some("why") => {
                 let input = why_tool_arguments_from_json(call.arguments()).map_err(user_message)?;
-                let output = project::why(&self.project_root, &input.file, input.anchor.as_deref())
-                    .map_err(user_message)?;
+                // A `line` query resolves to the decision covering that line,
+                // matching the CLI's `why <file> <line>` semantics. Previously
+                // `line` was silently dropped and a whole-file (or first-anchor)
+                // result was returned — confidently wrong (audit blocker B12).
+                let output = match input.line {
+                    Some(line) => project::why_for_line(&self.project_root, &input.file, line)
+                        .map_err(user_message)?,
+                    None => project::why(&self.project_root, &input.file, input.anchor.as_deref())
+                        .map_err(user_message)?,
+                };
                 Ok(text_result(&output))
             }
             Some("ghost_check") => {
@@ -140,6 +148,7 @@ impl ToolCallHandler for ProjectToolHandler {
 pub struct WhyToolArguments {
     pub file: RelativePath,
     pub anchor: Option<String>,
+    pub line: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,7 +186,32 @@ pub fn why_tool_arguments_from_json(value: &JsonValue) -> Result<WhyToolArgument
             "file",
         )?)?,
         anchor: optional_tool_non_empty_string(object, "anchor")?,
+        line: optional_tool_positive_line(object, "line")?,
     })
+}
+
+/// Parse an optional positive line number from a tool argument. A JSON number
+/// is accepted only when it is a positive integer (matching the CLI's
+/// `why <file> <line>` contract); anything else is a schema error rather than a
+/// silently-dropped field (audit blocker B12).
+fn optional_tool_positive_line(object: &JsonObject, key: &str) -> Result<Option<u32>> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    match value {
+        JsonValue::Null => Ok(None),
+        JsonValue::Number(number) => {
+            let rounded = *number as u64;
+            if *number >= 1.0 && (rounded as f64 - number).abs() < f64::EPSILON {
+                u32::try_from(rounded)
+                    .map(Some)
+                    .map_err(|_| ArchivaError::schema(key, "line is out of range"))
+            } else {
+                Err(ArchivaError::schema(key, "expected a positive integer"))
+            }
+        }
+        _ => Err(ArchivaError::schema(key, "expected a positive integer")),
+    }
 }
 
 pub fn ghost_check_tool_arguments_from_json(value: &JsonValue) -> Result<GhostCheckToolArguments> {
@@ -255,7 +289,22 @@ where
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = handle_protocol_line_with_tool_handler(line, &mut handler) {
+        // Outer panic backstop: even if request dispatch panics outside a tool
+        // call (e.g. in parsing or method routing), the server must survive and
+        // keep serving. Catch any unwind, log nothing to stdout except a
+        // well-formed JSON-RPC error echoing the request id when recoverable.
+        let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_protocol_line_with_tool_handler(line, &mut handler)
+        }));
+        let response = match dispatched {
+            Ok(response) => response,
+            Err(panic) => Some(error_response(
+                recover_request_id(line),
+                -32603,
+                &panic_message(panic),
+            )),
+        };
+        if let Some(response) = response {
             writeln!(writer, "{}", json::stringify_compact(&response))
                 .map_err(|source| ArchivaError::io(None, "write MCP response", source))?;
             writer
@@ -398,6 +447,45 @@ pub fn text_result(text: &str) -> JsonValue {
     )])
 }
 
+/// An MCP tool result flagged as an error (`isError: true`). Per the MCP spec,
+/// a tool that fails should return its error as a result with this flag rather
+/// than a JSON-RPC protocol error, so the client attributes it to the tool call
+/// and the session continues. Used when a tool invocation panics (B1b): the
+/// long-lived server must never abort on one bad request.
+pub fn error_text_result(text: &str) -> JsonValue {
+    object(vec![
+        (
+            "content",
+            JsonValue::Array(vec![object(vec![
+                ("type", JsonValue::String("text".to_string())),
+                ("text", JsonValue::String(text.to_string())),
+            ])]),
+        ),
+        ("isError", JsonValue::Bool(true)),
+    ])
+}
+
+/// Best-effort human-readable message from a caught panic payload.
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = panic.downcast_ref::<&str>() {
+        format!("internal error: {text}")
+    } else if let Some(text) = panic.downcast_ref::<String>() {
+        format!("internal error: {text}")
+    } else {
+        "internal error: request handling panicked".to_string()
+    }
+}
+
+/// Recover the JSON-RPC `id` from a raw request line on a best-effort basis, so
+/// the panic-backstop error response can echo the correct id. Returns `None`
+/// (rendered as `id: null`) when the line cannot be parsed or carries no id.
+fn recover_request_id(line: &str) -> Option<JsonValue> {
+    match json::parse(line) {
+        Ok(JsonValue::Object(object)) => object.get("id").cloned(),
+        _ => None,
+    }
+}
+
 pub fn tool_definitions() -> Vec<JsonValue> {
     vec![write_decision_tool(), why_tool(), ghost_check_tool()]
 }
@@ -407,9 +495,21 @@ fn handle_tool_call(
     params: Option<&JsonValue>,
     handler: &mut dyn ToolCallHandler,
 ) -> JsonValue {
-    match parse_tool_call_params(params).and_then(|call| handler.call_tool(call)) {
-        Ok(result) => success_response(id, result),
-        Err(message) => error_response(id, -32000, &message),
+    let call = match parse_tool_call_params(params) {
+        Ok(call) => call,
+        Err(message) => return error_response(id, -32000, &message),
+    };
+    // Per-request panic boundary: a tool implementation that panics (e.g. an
+    // unforeseen parser edge case on committed input) must not abort the
+    // long-lived server. Catch it and report it as an MCP tool error
+    // (isError: true) so the client attributes it to this call and the session
+    // continues serving subsequent requests.
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.call_tool(call)));
+    match outcome {
+        Ok(Ok(result)) => success_response(id, result),
+        Ok(Err(message)) => error_response(id, -32000, &message),
+        Err(panic) => success_response(id, error_text_result(&panic_message(panic))),
     }
 }
 
@@ -545,7 +645,8 @@ fn why_tool() -> JsonValue {
         (
             "description",
             JsonValue::String(
-                "Look up the decision log for a file and anchor before modifying it.".to_string(),
+                "Look up the decision log for a file, by anchor or line, before modifying it."
+                    .to_string(),
             ),
         ),
         (
@@ -555,7 +656,11 @@ fn why_tool() -> JsonValue {
                 ("required", string_array(&["file"])),
                 (
                     "properties",
-                    object(vec![("file", string_type()), ("anchor", string_type())]),
+                    object(vec![
+                        ("file", string_type()),
+                        ("anchor", string_type()),
+                        ("line", number_type()),
+                    ]),
                 ),
             ]),
         ),
@@ -670,6 +775,55 @@ mod tests {
         }
     }
 
+    struct PanicOnceToolHandler {
+        panicked: bool,
+    }
+
+    impl ToolCallHandler for PanicOnceToolHandler {
+        fn call_tool(&mut self, call: ToolCall) -> std::result::Result<JsonValue, String> {
+            if call.name().matches("boom") {
+                self.panicked = true;
+                panic!("simulated tool panic on committed input");
+            }
+            Ok(text_result("survived"))
+        }
+    }
+
+    #[test]
+    fn tool_panic_is_contained_as_iserror_and_session_continues() {
+        // A panicking tool call must not abort the server. It should come back
+        // as a tool result with isError: true (echoing the request id), and a
+        // subsequent request on the same handler must still be served.
+        let mut handler = PanicOnceToolHandler { panicked: false };
+
+        let prior_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let boom = handle_protocol_line_with_tool_handler(
+            "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\",\"params\":{\"name\":\"boom\"}}",
+            &mut handler,
+        )
+        .unwrap();
+        std::panic::set_hook(prior_hook);
+
+        assert!(handler.panicked);
+        let rendered = stringify_compact(&boom);
+        assert!(rendered.contains("\"id\":42"), "{rendered}");
+        assert!(rendered.contains("\"isError\":true"), "{rendered}");
+        assert!(rendered.contains("internal error"), "{rendered}");
+        // It is a result envelope, not a protocol error.
+        assert!(rendered.contains("\"result\""), "{rendered}");
+        assert!(!rendered.contains("\"error\":{"), "{rendered}");
+
+        let after = handle_protocol_line_with_tool_handler(
+            "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"tools/call\",\"params\":{\"name\":\"ok\"}}",
+            &mut handler,
+        )
+        .unwrap();
+        let after_rendered = stringify_compact(&after);
+        assert!(after_rendered.contains("survived"), "{after_rendered}");
+        assert!(after_rendered.contains("\"id\":43"), "{after_rendered}");
+    }
+
     #[test]
     fn builds_initialize_result_matching_typescript_contract() {
         assert_eq!(
@@ -686,7 +840,7 @@ mod tests {
         let output = stringify_compact(&tools_list_result());
         assert_eq!(
             output,
-            "{\"tools\":[{\"name\":\"write_decision\",\"description\":\"Log a decision you just made: what you chose, why, and what you rejected.\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"file\",\"anchor\",\"lines\",\"chose\",\"because\",\"rejected\"],\"properties\":{\"file\":{\"type\":\"string\"},\"anchor\":{\"type\":\"string\"},\"lines\":{\"type\":\"array\",\"items\":{\"type\":\"number\"},\"minItems\":2,\"maxItems\":2},\"chose\":{\"type\":\"string\"},\"because\":{\"type\":\"string\"},\"rejected\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"required\":[\"approach\",\"reason\"],\"properties\":{\"approach\":{\"type\":\"string\"},\"reason\":{\"type\":\"string\"}}}},\"expires_if\":{\"type\":\"string\"},\"supersedes\":{\"type\":\"string\"}}}},{\"name\":\"why\",\"description\":\"Look up the decision log for a file and anchor before modifying it.\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"file\"],\"properties\":{\"file\":{\"type\":\"string\"},\"anchor\":{\"type\":\"string\"}}}},{\"name\":\"ghost_check\",\"description\":\"Check for stale or orphaned decisions in a file.\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"file\"],\"properties\":{\"file\":{\"type\":\"string\"}}}}]}"
+            "{\"tools\":[{\"name\":\"write_decision\",\"description\":\"Log a decision you just made: what you chose, why, and what you rejected.\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"file\",\"anchor\",\"lines\",\"chose\",\"because\",\"rejected\"],\"properties\":{\"file\":{\"type\":\"string\"},\"anchor\":{\"type\":\"string\"},\"lines\":{\"type\":\"array\",\"items\":{\"type\":\"number\"},\"minItems\":2,\"maxItems\":2},\"chose\":{\"type\":\"string\"},\"because\":{\"type\":\"string\"},\"rejected\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"required\":[\"approach\",\"reason\"],\"properties\":{\"approach\":{\"type\":\"string\"},\"reason\":{\"type\":\"string\"}}}},\"expires_if\":{\"type\":\"string\"},\"supersedes\":{\"type\":\"string\"}}}},{\"name\":\"why\",\"description\":\"Look up the decision log for a file, by anchor or line, before modifying it.\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"file\"],\"properties\":{\"file\":{\"type\":\"string\"},\"anchor\":{\"type\":\"string\"},\"line\":{\"type\":\"number\"}}}},{\"name\":\"ghost_check\",\"description\":\"Check for stale or orphaned decisions in a file.\",\"inputSchema\":{\"type\":\"object\",\"required\":[\"file\"],\"properties\":{\"file\":{\"type\":\"string\"}}}}]}"
         );
         assert!(!output.contains("\"session\""));
     }
@@ -846,12 +1000,22 @@ mod tests {
         .unwrap();
         assert_eq!(why.file.as_str(), "src/main.ts");
         assert_eq!(why.anchor.as_deref(), Some("fn:main"));
+        assert_eq!(why.line, None);
 
         let why_without_anchor = why_tool_arguments_from_json(
             &crate::core::json::parse("{\"file\":\"src/main.ts\"}").unwrap(),
         )
         .unwrap();
         assert_eq!(why_without_anchor.anchor, None);
+        assert_eq!(why_without_anchor.line, None);
+
+        // B12: the `line` field is parsed (not silently dropped) and drives a
+        // line-based lookup.
+        let why_by_line = why_tool_arguments_from_json(
+            &crate::core::json::parse("{\"file\":\"src/main.ts\",\"line\":42}").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(why_by_line.line, Some(42));
 
         let ghost = ghost_check_tool_arguments_from_json(
             &crate::core::json::parse("{\"file\":\"src/drift.ts\",\"anchor\":\"ignored\"}")
@@ -889,6 +1053,67 @@ mod tests {
             hardened_path.user_message(),
             "Invalid project-relative path \"../outside.ts\": parent path segments are not allowed"
         );
+
+        // B12: a non-positive / non-integer `line` is a schema error, not a
+        // silently-dropped field.
+        for bad in ["0", "-3", "2.5", "\"7\"", "true"] {
+            let error = why_tool_arguments_from_json(
+                &crate::core::json::parse(&format!("{{\"file\":\"src/main.ts\",\"line\":{bad}}}"))
+                    .unwrap(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.user_message(),
+                "line: expected a positive integer",
+                "input line={bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn why_line_query_returns_decision_covering_the_line() {
+        // B12: an MCP `why` call with a `line` resolves to the decision covering
+        // that line — the same result as CLI `why <file> <line>` — instead of
+        // dropping the field and returning a whole-file (wrong) answer.
+        let root = unique_temp_dir("archiva-mcp-why-line");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src").join("multi.ts"),
+            "function first() {\n  return 1;\n}\n\nfunction second() {\n  return 2;\n}\n",
+        )
+        .unwrap();
+
+        let setup = handle_protocol_input(
+            &root,
+            concat!(
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"write_decision\",\"arguments\":{\"file\":\"src/multi.ts\",\"anchor\":\"fn:first\",\"lines\":[1,3],\"chose\":\"first choice\",\"because\":\"a\",\"rejected\":[]}}}\n",
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"write_decision\",\"arguments\":{\"file\":\"src/multi.ts\",\"anchor\":\"fn:second\",\"lines\":[5,7],\"chose\":\"second choice\",\"because\":\"b\",\"rejected\":[]}}}\n",
+            ),
+        )
+        .unwrap();
+        assert!(setup.contains("Recorded dec_001."));
+        assert!(setup.contains("Recorded dec_002."));
+
+        // Line 6 is inside fn:second (lines 5-7): must return the second decision.
+        let by_line = handle_protocol_input(
+            &root,
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"why\",\"arguments\":{\"file\":\"src/multi.ts\",\"line\":6}}}\n",
+        )
+        .unwrap();
+        assert!(by_line.contains("second choice"), "{by_line}");
+        assert!(!by_line.contains("first choice"), "{by_line}");
+
+        // A line outside any decision returns a precise not-found, not a wrong
+        // decision.
+        let miss = handle_protocol_input(
+            &root,
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"why\",\"arguments\":{\"file\":\"src/multi.ts\",\"line\":99}}}\n",
+        )
+        .unwrap();
+        assert!(miss.contains("No decision found"), "{miss}");
+        assert!(miss.contains("line 99"), "{miss}");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

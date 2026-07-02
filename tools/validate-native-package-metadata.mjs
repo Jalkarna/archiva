@@ -19,6 +19,7 @@ const expectedRootFiles = [
   "schema",
   "tools/install-native.mjs",
   "tools/native-targets.mjs",
+  "docs",
   "README.md",
   "LICENSE"
 ];
@@ -556,7 +557,30 @@ function workflowMatrixInclude(file, text, jobName) {
 
     const fieldMatch = item.line.match(/^\s+([A-Za-z_][A-Za-z0-9_-]*):\s*(.*?)\s*$/);
     if (fieldMatch && current) {
-      current[fieldMatch[1]] = parseWorkflowScalar(fieldMatch[2]);
+      const fieldIndent = countIndent(item.line);
+      const value = parseWorkflowScalar(fieldMatch[2]);
+      if (value === "|") {
+        const scalarLines = [];
+        let nextIndex = index + 1;
+        while (nextIndex < block.length) {
+          const nextItem = block[nextIndex];
+          if (!nextItem.line.trim()) {
+            scalarLines.push("");
+            nextIndex += 1;
+            continue;
+          }
+          const nextIndent = countIndent(nextItem.line);
+          if (nextIndent <= fieldIndent) {
+            break;
+          }
+          scalarLines.push(nextItem.line.trim());
+          nextIndex += 1;
+        }
+        current[fieldMatch[1]] = scalarLines.filter(Boolean).join("\n");
+        index = nextIndex - 1;
+        continue;
+      }
+      current[fieldMatch[1]] = value;
       continue;
     }
 
@@ -623,6 +647,47 @@ function validateNativePackageArtifactUpload(file, text) {
   assert(!body.includes("path: target/npm-tarballs/*.tgz"), `${file} native-package artifact upload must not collect fixture tarballs.`);
 }
 
+function validateCiTestWorkflowBehavior(file, text) {
+  const block = workflowJobBlock(file, text, "test");
+  const body = block.map((item) => item.line).join("\n");
+  const requiredSteps = [
+    ["Native differential", "npm run differential:release"],
+    ["Native stress", "npm run stress:rust-port"],
+    ["Reduced scale smoke", "npm run scale:smoke"],
+    ["Package smoke test", "npm run smoke:package"]
+  ];
+  for (const [label, command] of requiredSteps) {
+    assert(body.includes(label), `${file} test job must include the ${label} step.`);
+    assert(body.includes(command), `${file} test job ${label} step drifted.`);
+  }
+  const reducedScaleEnv = {
+    ARCHIVA_SCALE_FILES: "32",
+    ARCHIVA_SCALE_DECISIONS: "12",
+    ARCHIVA_SCALE_MUTATE_FILES: "8",
+    ARCHIVA_SCALE_PARITY_FILES: "16",
+    ARCHIVA_SCALE_PARITY_DECISIONS: "8",
+    ARCHIVA_SCALE_PARITY_MUTATE_FILES: "6"
+  };
+  for (const [name, value] of Object.entries(reducedScaleEnv)) {
+    assert(body.includes(`${name}: "${value}"`), `${file} test job reduced scale smoke must set ${name}=${value}.`);
+  }
+}
+
+function validatePublishWorkflowLockfileRefresh(file, text) {
+  for (const jobName of ["heavy-validation", "long-horizon-corpus", "publish-native", "publish-meta"]) {
+    const block = workflowJobBlock(file, text, jobName);
+    const body = block.map((item) => item.line).join("\n");
+    assert(
+      body.includes("npm install --package-lock-only --ignore-scripts"),
+      `${file} job ${jobName} must refresh lockfile registry metadata before npm ci.`
+    );
+    assert(
+      body.includes("git checkout -- package-lock.json"),
+      `${file} job ${jobName} must restore the committed lockfile after npm ci.`
+    );
+  }
+}
+
 function validatePublishNativeWorkflowBehavior(file, text) {
   const block = workflowJobBlock(file, text, "publish-native");
   const body = block.map((item) => item.line).join("\n");
@@ -661,7 +726,20 @@ function validatePostPublishSmokeWorkflowBehavior(file, text) {
     assert(body.includes("NPM_CONFIG_INCLUDE: optional"), `${file} job ${jobName} must force optional native dependencies on.`);
     assert(body.includes("NPM_CONFIG_IGNORE_SCRIPTS: \"false\""), `${file} job ${jobName} must force postinstall scripts on.`);
     assert(body.includes("\"@jalkarna/archiva@$VERSION\""), `${file} job ${jobName} must smoke the published root package version.`);
-    if (jobName === "post-publish-musl-smoke") { assert(!body.includes("actions/checkout"), `${file} job ${jobName} must not use JavaScript checkout inside the Alpine container.`); assert(body.includes("npm install --include=optional --ignore-scripts=false \"@jalkarna/archiva@$VERSION\""), `${file} job ${jobName} must install the published root package in Alpine with optional dependencies and scripts enabled.`); assert(body.includes("node_modules/@jalkarna/archiva-${ARCHIVA_NATIVE_TARGET}/package.json"), `${file} job ${jobName} must assert the target musl native package was installed.`); assert(body.includes("node_modules/@jalkarna/archiva-${ARCHIVA_NATIVE_TARGET}/bin/archiva"), `${file} job ${jobName} must execute the target musl native binary.`); assert(body.includes("test \"$actual\" = \"$VERSION\""), `${file} job ${jobName} must verify the native binary version.`); continue; }
+    if (jobName === "post-publish-musl-smoke") {
+      assert(!body.includes("actions/checkout"), `${file} job ${jobName} must not use JavaScript checkout inside the Alpine container.`);
+      assert(body.includes("npm install --include=optional --ignore-scripts=false \"@jalkarna/archiva@$VERSION\""), `${file} job ${jobName} must install the published root package in Alpine with optional dependencies and scripts enabled.`);
+      assert(body.includes("node_modules/@jalkarna/archiva-${ARCHIVA_NATIVE_TARGET}/package.json"), `${file} job ${jobName} must assert the target musl native package was installed.`);
+      assert(body.includes("native_bin=\"$tmpdir/node_modules/@jalkarna/archiva-${ARCHIVA_NATIVE_TARGET}/bin/archiva\""), `${file} job ${jobName} must keep the target musl native binary path absolute after changing directories.`);
+      assert(body.includes("test \"$actual\" = \"$VERSION\""), `${file} job ${jobName} must verify the native binary version.`);
+      assert(body.includes("\"$native_bin\" init"), `${file} job ${jobName} must initialize a project with the musl native binary.`);
+      assert(body.includes("\"$native_bin\" write-decision --json"), `${file} job ${jobName} must exercise decision writes with the musl native binary.`);
+      assert(body.includes("\"$native_bin\" why sample.ts fn:smoke"), `${file} job ${jobName} must exercise decision reads with the musl native binary.`);
+      assert(body.includes("\"$native_bin\" status"), `${file} job ${jobName} must exercise status with the musl native binary.`);
+      assert(body.includes("\"$native_bin\" lint"), `${file} job ${jobName} must exercise lint with the musl native binary.`);
+      assert(body.includes("\"$native_bin\" mcp"), `${file} job ${jobName} must exercise MCP with the musl native binary.`);
+      continue;
+    }
     assert(body.includes("node tools/smoke-native-package.mjs --published-spec"), `${file} job ${jobName} must run the full published package smoke helper.`);
     assert(body.includes("--target \"${{ matrix.target }}\""), `${file} job ${jobName} must pass the matrix target to the smoke helper.`);
     assert(!body.includes("archiva --version"), `${file} job ${jobName} must not regress to version-only smoke.`); }
@@ -714,11 +792,42 @@ function validateCombinedSeededScaleWorkflow(file, text) {
   }
 }
 
-function validateHeavyValidationStressWorkflow(file, text) {
+function validateHeavyValidationWorkflow(file, text) {
   const block = workflowJobBlock(file, text, "heavy-validation");
   const body = block.map((item) => item.line).join("\n");
-  assert(body.includes("npm run stress:soak | tee archiva-stress-soak.json"), `${file} heavy-validation must run the native stress soak.`);
-  assert(body.includes("archiva-stress-soak.json"), `${file} heavy-validation must upload the native stress soak artifact.`);
+  const requiredSteps = [
+    ["Check", "npm run check"],
+    ["Build package artifacts", "npm run build"],
+    ["Test", "npm test"],
+    ["Package smoke test", "npm run smoke:package"],
+    ["Rust property soak", "npm run property:soak"],
+    ["Native differential", "npm run --silent differential:release | tee archiva-differential.json"],
+    ["Native stress soak", "npm run --silent stress:soak | tee archiva-stress-soak.json"],
+    ["Benchmark comparison", "npm run --silent benchmark:compare | tee archiva-benchmark.json"],
+    ["Synthetic scale smoke", "npm run --silent scale:smoke | tee archiva-scale-smoke.json"],
+    ["Combined seeded scale", "npm run --silent scale:smoke | tee archiva-scale-seeded.json"],
+    ["Checkout external corpus", "repository: ${{ env.ARCHIVA_CORPUS_REPOSITORY }}"],
+    ["External corpus scale", "npm run --silent scale:corpus | tee archiva-scale-corpus.json"],
+    ["Rust self-corpus scale", "npm run --silent scale:corpus:rust | tee archiva-scale-rust-corpus.json"]
+  ];
+
+  for (const [label, needle] of requiredSteps) {
+    assert(body.includes(label), `${file} heavy-validation must include the ${label} step.`);
+    assert(body.includes(needle), `${file} heavy-validation ${label} step drifted.`);
+  }
+
+  for (const artifact of [
+    "archiva-differential.json",
+    "archiva-stress-soak.json",
+    "archiva-benchmark.json",
+    "archiva-scale-smoke.json",
+    "archiva-scale-seeded.json",
+    "archiva-scale-corpus.json",
+    "archiva-scale-rust-corpus.json"
+  ]) {
+    assert(body.includes(artifact), `${file} heavy-validation must upload ${artifact}.`);
+  }
+  assert(body.includes("if: always()"), `${file} heavy-validation artifact upload must run with if: always().`);
 }
 
 async function validateWorkflowMatrices() {
@@ -735,11 +844,13 @@ async function validateWorkflowMatrices() {
   validateWorkflowActionPins(ciFile, ci);
   validateWorkflowActionPins(publishFile, publish);
   validateWorkflowActionPins(validationFile, validation);
+  validatePublishWorkflowLockfileRefresh(publishFile, publish);
   validateNativeBuildWorkflowMatrix(ciFile, ci, "native-package");
   validateNativeBuildWorkflowMatrix(publishFile, publish, "publish-native");
   validateNativePackageSmokeWorkflowBehavior(ciFile, ci, "native-package");
   validateNativePackageSmokeWorkflowBehavior(publishFile, publish, "publish-native");
   validateNativePackageArtifactUpload(ciFile, ci);
+  validateCiTestWorkflowBehavior(ciFile, ci);
   validatePublishNativeWorkflowBehavior(publishFile, publish);
   validatePublishMetaWorkflowBehavior(publishFile, publish);
   validatePublishWorkflowConcurrency(publishFile, publish);
@@ -748,10 +859,12 @@ async function validateWorkflowMatrices() {
   validatePostPublishSmokeWorkflowBehavior(publishFile, publish);
   validateCombinedSeededScaleWorkflow(validationFile, validation);
   validateCombinedSeededScaleWorkflow(publishFile, publish);
-  validateHeavyValidationStressWorkflow(validationFile, validation);
-  validateHeavyValidationStressWorkflow(publishFile, publish);
+  validateHeavyValidationWorkflow(validationFile, validation);
+  validateHeavyValidationWorkflow(publishFile, publish);
   validateRustSelfCorpusWorkflow(validationFile, validation);
   validateRustSelfCorpusWorkflow(publishFile, publish);
+  validateLongHorizonCorpusWorkflow(validationFile, validation);
+  validatePublishLongHorizonCorpusWorkflow(publishFile, publish);
 }
 
 function expectedRustToolchainVersion() {
@@ -834,4 +947,192 @@ function validateRustSelfCorpusWorkflow(file, text) {
   assert(body.includes('ARCHIVA_SCALE_CORPUS_ROOT="$GITHUB_WORKSPACE/src"'), `${file} Rust self-corpus scale must use the checked-out Rust source tree.`);
   assert(body.includes("npm run --silent scale:corpus:rust | tee archiva-scale-rust-corpus.json"), `${file} must capture the Rust self-corpus scale artifact.`);
   assert(body.includes("archiva-scale-rust-corpus.json"), `${file} must upload the Rust self-corpus scale artifact.`);
+}
+
+function validateLongHorizonCorpusMatrix(file, text) {
+  const block = workflowJobBlock(file, text, "long-horizon-corpus");
+  const body = block.map((item) => item.line).join("\n");
+  const entries = workflowMatrixInclude(file, text, "long-horizon-corpus");
+  const expected = new Map([
+    [
+      "rust-compiler",
+      {
+        repository: "rust-lang/rust",
+        ref: "096694416a41840709140eb0fd0ca193d1a3e6ba",
+        sparse_paths: ["compiler/rustc_ast/src", "compiler/rustc_middle/src"],
+        language: "rust",
+        files: "140",
+        decisions: "60",
+        mutate_files: "36"
+      }
+    ],
+    [
+      "cargo",
+      {
+        repository: "rust-lang/cargo",
+        ref: "1ee1ce4eaec3c2433e0b28fc3e903ee917c5eea8",
+        sparse_paths: ["src", "crates"],
+        language: "rust",
+        files: "140",
+        decisions: "60",
+        mutate_files: "36"
+      }
+    ],
+    [
+      "ripgrep",
+      {
+        repository: "BurntSushi/ripgrep",
+        ref: "dfe4a81d2591daca76d25ae4e052c34b26578155",
+        sparse_paths: ["crates", "src"],
+        language: "rust",
+        files: "100",
+        decisions: "40",
+        mutate_files: "24"
+      }
+    ],
+    [
+      "tokio",
+      {
+        repository: "tokio-rs/tokio",
+        ref: "7b354d22a9b77cd66c3b622e6fca9fe3b77133d1",
+        sparse_paths: ["tokio/src", "tokio-macros/src"],
+        language: "rust",
+        files: "120",
+        decisions: "50",
+        mutate_files: "30"
+      }
+    ],
+    [
+      "linux-kernel",
+      {
+        repository: "torvalds/linux",
+        ref: "dc59e4fea9d83f03bad6bddf3fa2e52491777482",
+        sparse_paths: ["kernel", "mm", "fs"],
+        language: "c/cpp",
+        files: "120",
+        decisions: "50",
+        mutate_files: "30"
+      }
+    ],
+    [
+      "llvm",
+      {
+        repository: "llvm/llvm-project",
+        ref: "2902b031f0fd3e02444db4b536da798d4d358ea4",
+        sparse_paths: ["llvm/lib/Analysis", "llvm/lib/IR", "clang/lib/AST", "clang/lib/Sema"],
+        language: "c/cpp",
+        files: "120",
+        decisions: "50",
+        mutate_files: "30"
+      }
+    ],
+    [
+      "typescript",
+      {
+        repository: "microsoft/TypeScript",
+        ref: "637d5746b70257028fb95aad32ddec6b26ab0a14",
+        sparse_paths: ["src"],
+        language: "typescript",
+        files: "140",
+        decisions: "60",
+        mutate_files: "36"
+      }
+    ],
+    [
+      "node",
+      {
+        repository: "nodejs/node",
+        ref: "f2f241a40ffca9ec72a103842a5e52c0c4f52767",
+        sparse_paths: ["lib"],
+        language: "typescript",
+        files: "140",
+        decisions: "60",
+        mutate_files: "36"
+      }
+    ],
+    [
+      "react",
+      {
+        repository: "facebook/react",
+        ref: "d4e44545a984186fc97783e130896e9c2e5c1a63",
+        sparse_paths: ["packages"],
+        language: "typescript",
+        files: "140",
+        decisions: "60",
+        mutate_files: "36"
+      }
+    ],
+    [
+      "next",
+      {
+        repository: "vercel/next.js",
+        ref: "44684abb43687f7f1b06a5417887b0fcf971fccb",
+        sparse_paths: ["packages"],
+        language: "typescript",
+        files: "140",
+        decisions: "60",
+        mutate_files: "36"
+      }
+    ]
+  ]);
+
+  assert(body.includes("fail-fast: false"), `${file} long-horizon corpus matrix must not fail fast.`);
+  assert(body.includes("timeout-minutes: 90"), `${file} long-horizon corpus job must have a bounded timeout.`);
+  assert(body.includes("npm run build"), `${file} long-horizon corpus job must build native package artifacts.`);
+  assert(body.includes("repository: ${{ matrix.repository }}"), `${file} long-horizon checkout must use the matrix repository.`);
+  assert(body.includes("ref: ${{ matrix.ref }}"), `${file} long-horizon checkout must use the pinned matrix ref.`);
+  assert(body.includes("sparse-checkout: ${{ matrix.sparse_paths }}"), `${file} long-horizon checkout must use matrix sparse paths.`);
+  assert(body.includes("ARCHIVA_SCALE_CORPUS_ROOT: ${{ github.workspace }}/corpus"), `${file} long-horizon corpus root must point at the checked-out corpus.`);
+  assert(body.includes("ARCHIVA_SCALE_CORPUS_LANGUAGE: ${{ matrix.language }}"), `${file} long-horizon corpus language must come from the matrix.`);
+  assert(body.includes("ARCHIVA_SCALE_CORPUS_FILES: ${{ matrix.files }}"), `${file} long-horizon corpus file count must come from the matrix.`);
+  assert(body.includes("ARCHIVA_SCALE_CORPUS_DECISIONS: ${{ matrix.decisions }}"), `${file} long-horizon corpus decision count must come from the matrix.`);
+  assert(body.includes("ARCHIVA_SCALE_CORPUS_MUTATE_FILES: ${{ matrix.mutate_files }}"), `${file} long-horizon corpus mutation count must come from the matrix.`);
+  assert(body.includes("npm run --silent scale:corpus | tee \"archiva-long-horizon-${{ matrix.name }}.json\""), `${file} long-horizon corpus job must capture a per-corpus JSON artifact.`);
+  assert(body.includes("name: archiva-long-horizon-${{ matrix.name }}"), `${file} long-horizon corpus artifact must include the matrix name.`);
+
+  assert(entries.length === expected.size, `${file} long-horizon corpus matrix must contain ${expected.size} repositories.`);
+  const languages = new Set();
+  for (const entry of entries) {
+    const expectation = expected.get(entry.name);
+    assert(expectation, `${file}:${entry.__line} unexpected long-horizon corpus ${entry.name}.`);
+    assert(/^[0-9a-f]{40}$/.test(entry.ref), `${file}:${entry.__line} long-horizon corpus ${entry.name} ref must be a pinned commit SHA.`);
+    for (const field of ["repository", "ref", "language", "files", "decisions", "mutate_files"]) {
+      assert(entry[field] === expectation[field], `${file}:${entry.__line} long-horizon corpus ${entry.name} ${field} drifted.`);
+    }
+    assertEqual(
+      String(entry.sparse_paths).split("\n").filter(Boolean),
+      expectation.sparse_paths,
+      `${file}:${entry.__line} long-horizon corpus ${entry.name} sparse paths`
+    );
+    languages.add(entry.language);
+  }
+  assert(
+    languages.has("rust") && languages.has("typescript") && languages.has("c/cpp"),
+    `${file} long-horizon corpus matrix must cover Rust, JavaScript-family, and C/C++ corpora.`
+  );
+  return body;
+}
+
+function validateLongHorizonCorpusWorkflow(file, text) {
+  const body = validateLongHorizonCorpusMatrix(file, text);
+  assert(
+    text.includes("run_long_horizon:") && text.includes("type: boolean"),
+    `${file} must expose a manual opt-in for long-horizon corpus validation.`
+  );
+  assert(
+    body.includes("github.event_name == 'schedule' || github.event.inputs.run_long_horizon == 'true'"),
+    `${file} long-horizon corpus job must run only on schedule or manual opt-in.`
+  );
+}
+
+function validatePublishLongHorizonCorpusWorkflow(file, text) {
+  const body = validateLongHorizonCorpusMatrix(file, text);
+  const publishNativeBody = workflowJobBlock(file, text, "publish-native").map((item) => item.line).join("\n");
+  assert(body.includes("needs: heavy-validation"), `${file} long-horizon corpus job must run after heavy-validation.`);
+  assert(!body.includes("run_long_horizon"), `${file} publish long-horizon corpus job must not be manually optional.`);
+  assert(!body.includes("github.event_name == 'schedule'"), `${file} publish long-horizon corpus job must not be schedule-gated.`);
+  assert(
+    publishNativeBody.includes("needs: [heavy-validation, long-horizon-corpus]"),
+    `${file} publish-native must wait for heavy-validation and long-horizon corpus validation.`
+  );
 }

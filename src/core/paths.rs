@@ -116,6 +116,61 @@ pub fn decision_lock_path(project_root: &Path, relative: &RelativePath) -> PathB
     with_extension_suffix(decision_base_path(project_root, relative), "lock")
 }
 
+/// Guard the *write* path against a symlink escape (audit blocker B7).
+///
+/// The read path canonicalizes and rejects paths that resolve outside the
+/// project, but the write path did not: a checked-in symlink at a directory
+/// component under `.decisions/` (e.g. `.decisions/src` -> `/outside`) would
+/// make `dlog_path`/`dmap_path` resolve outside the repo, and the write would
+/// follow it — writing `.dlog`/`.dmap` outside the project and potentially
+/// clobbering a same-named file there.
+///
+/// This canonicalizes the deepest already-existing ancestor of the decision
+/// file (that is where a malicious symlink component would be) and confirms it
+/// stays within the canonicalized `.decisions` root. Non-existent components
+/// (the file itself, directories to be created) can't be symlinks yet, so only
+/// existing ancestors need checking. Returns an `EscapesProjectRoot` error if
+/// the resolved location escapes.
+pub fn assert_decision_path_contained(
+    project_root: &Path,
+    relative: &RelativePath,
+) -> Result<(), PathError> {
+    let decisions_root = project_root.join(".decisions");
+    // Canonicalize the decisions root, creating it if needed is the caller's
+    // job; if it does not exist yet there is nothing to escape through.
+    let canonical_root = match decisions_root.canonicalize() {
+        Ok(root) => root,
+        Err(_) => return Ok(()),
+    };
+
+    let target = decision_base_path(project_root, relative);
+    // Find the deepest ancestor that currently exists on disk.
+    let mut existing = target.as_path();
+    loop {
+        match existing.try_exists() {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(error) => return Err(PathError::io(relative.as_str(), error)),
+        }
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => return Ok(()),
+        }
+    }
+
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|error| PathError::io(relative.as_str(), error))?;
+    if canonical_existing.starts_with(&canonical_root) {
+        Ok(())
+    } else {
+        Err(PathError::new(
+            PathErrorKind::EscapesProjectRoot,
+            relative.as_str(),
+        ))
+    }
+}
+
 pub fn source_path_from_decision_file(
     project_root: &Path,
     decision_file_path: &Path,

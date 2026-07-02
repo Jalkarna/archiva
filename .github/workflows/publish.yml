@@ -42,8 +42,14 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.96.0
 
+      - name: Refresh lockfile registry metadata
+        run: npm install --package-lock-only --ignore-scripts
+
       - name: Install
         run: npm ci
+
+      - name: Restore committed lockfile
+        run: git checkout -- package-lock.json
 
       - name: Verify release version
         run: |
@@ -80,18 +86,21 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: Package smoke test
+        run: npm run smoke:package
+
       - name: Rust property soak
         run: npm run property:soak
 
       - name: Native differential
         run: |
           set -o pipefail
-          npm run differential:release | tee archiva-differential.json
+          npm run --silent differential:release | tee archiva-differential.json
 
       - name: Native stress soak
         run: |
           set -o pipefail
-          npm run stress:soak | tee archiva-stress-soak.json
+          npm run --silent stress:soak | tee archiva-stress-soak.json
 
       - name: Benchmark comparison
         timeout-minutes: 20
@@ -152,6 +161,7 @@ jobs:
             npm run --silent scale:corpus:rust | tee archiva-scale-rust-corpus.json
 
       - name: Upload validation artifacts
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: archiva-publish-heavy-validation
@@ -164,9 +174,173 @@ jobs:
             archiva-scale-corpus.json
             archiva-scale-rust-corpus.json
 
+  long-horizon-corpus:
+    needs: heavy-validation
+    name: Long-horizon corpus ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rust-compiler
+            repository: rust-lang/rust
+            ref: 096694416a41840709140eb0fd0ca193d1a3e6ba
+            sparse_paths: |
+              compiler/rustc_ast/src
+              compiler/rustc_middle/src
+            language: rust
+            files: "140"
+            decisions: "60"
+            mutate_files: "36"
+          - name: cargo
+            repository: rust-lang/cargo
+            ref: 1ee1ce4eaec3c2433e0b28fc3e903ee917c5eea8
+            sparse_paths: |
+              src
+              crates
+            language: rust
+            files: "140"
+            decisions: "60"
+            mutate_files: "36"
+          - name: ripgrep
+            repository: BurntSushi/ripgrep
+            ref: dfe4a81d2591daca76d25ae4e052c34b26578155
+            sparse_paths: |
+              crates
+              src
+            language: rust
+            files: "100"
+            decisions: "40"
+            mutate_files: "24"
+          - name: tokio
+            repository: tokio-rs/tokio
+            ref: 7b354d22a9b77cd66c3b622e6fca9fe3b77133d1
+            sparse_paths: |
+              tokio/src
+              tokio-macros/src
+            language: rust
+            files: "120"
+            decisions: "50"
+            mutate_files: "30"
+          - name: linux-kernel
+            repository: torvalds/linux
+            ref: dc59e4fea9d83f03bad6bddf3fa2e52491777482
+            sparse_paths: |
+              kernel
+              mm
+              fs
+            language: c/cpp
+            files: "120"
+            decisions: "50"
+            mutate_files: "30"
+          - name: llvm
+            repository: llvm/llvm-project
+            ref: 2902b031f0fd3e02444db4b536da798d4d358ea4
+            sparse_paths: |
+              llvm/lib/Analysis
+              llvm/lib/IR
+              clang/lib/AST
+              clang/lib/Sema
+            language: c/cpp
+            files: "120"
+            decisions: "50"
+            mutate_files: "30"
+          - name: typescript
+            repository: microsoft/TypeScript
+            ref: 637d5746b70257028fb95aad32ddec6b26ab0a14
+            sparse_paths: src
+            language: typescript
+            files: "140"
+            decisions: "60"
+            mutate_files: "36"
+          - name: node
+            repository: nodejs/node
+            ref: f2f241a40ffca9ec72a103842a5e52c0c4f52767
+            sparse_paths: lib
+            language: typescript
+            files: "140"
+            decisions: "60"
+            mutate_files: "36"
+          - name: react
+            repository: facebook/react
+            ref: d4e44545a984186fc97783e130896e9c2e5c1a63
+            sparse_paths: packages
+            language: typescript
+            files: "140"
+            decisions: "60"
+            mutate_files: "36"
+          - name: next
+            repository: vercel/next.js
+            ref: 44684abb43687f7f1b06a5417887b0fcf971fccb
+            sparse_paths: packages
+            language: typescript
+            files: "140"
+            decisions: "60"
+            mutate_files: "36"
+    env:
+      ARCHIVA_BENCHMARK_COMPARE_TIMEOUT_MS: "900000"
+      ARCHIVA_BASELINE_COMMAND_TIMEOUT_MS: "300000"
+      ARCHIVA_SCALE_COMMAND_TIMEOUT_MS: "600000"
+      ARCHIVA_SCALE_COMMAND_MAX_BUFFER_MB: "1024"
+    steps:
+      - name: Checkout Archiva
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.96.0
+
+      - name: Refresh lockfile registry metadata
+        run: npm install --package-lock-only --ignore-scripts
+
+      - name: Install
+        run: npm ci
+
+      - name: Restore committed lockfile
+        run: git checkout -- package-lock.json
+
+      - name: Build package artifacts
+        run: npm run build
+
+      - name: Checkout corpus
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: corpus
+          sparse-checkout: ${{ matrix.sparse_paths }}
+          sparse-checkout-cone-mode: false
+
+      - name: Corpus scale
+        timeout-minutes: 60
+        env:
+          ARCHIVA_SCALE_CORPUS_ROOT: ${{ github.workspace }}/corpus
+          ARCHIVA_SCALE_CORPUS_LANGUAGE: ${{ matrix.language }}
+          ARCHIVA_SCALE_CORPUS_FILES: ${{ matrix.files }}
+          ARCHIVA_SCALE_CORPUS_DECISIONS: ${{ matrix.decisions }}
+          ARCHIVA_SCALE_CORPUS_MUTATE_FILES: ${{ matrix.mutate_files }}
+        run: |
+          set -o pipefail
+          npm run --silent scale:corpus | tee "archiva-long-horizon-${{ matrix.name }}.json"
+
+      - name: Upload corpus artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: archiva-long-horizon-${{ matrix.name }}
+          path: archiva-long-horizon-${{ matrix.name }}.json
+
   publish-native:
     name: Publish native ${{ matrix.target }}
-    needs: heavy-validation
+    needs: [heavy-validation, long-horizon-corpus]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -217,8 +391,14 @@ jobs:
           rustup default 1.96.0
           rustup target add ${{ matrix.rust_target }}
 
+      - name: Refresh lockfile registry metadata
+        run: npm install --package-lock-only --ignore-scripts
+
       - name: Install
         run: npm ci
+
+      - name: Restore committed lockfile
+        run: git checkout -- package-lock.json
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.rust_target }}
@@ -253,8 +433,14 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           cache: npm
 
+      - name: Refresh lockfile registry metadata
+        run: npm install --package-lock-only --ignore-scripts
+
       - name: Install
         run: npm ci
+
+      - name: Restore committed lockfile
+        run: git checkout -- package-lock.json
 
       - name: Verify native packages are published
         run: node tools/npm-publish-idempotent.mjs --verify-native-targets
@@ -337,7 +523,7 @@ jobs:
           NPM_CONFIG_IGNORE_SCRIPTS: "false"
         run: |
           if [ "${GITHUB_REF_NAME#v}" = "$GITHUB_REF_NAME" ]; then
-            echo "Expected tag ref like v0.2.0; got $GITHUB_REF_NAME" >&2
+            echo "Expected tag ref like v<version>; got $GITHUB_REF_NAME" >&2
             exit 1
           fi
           VERSION="${GITHUB_REF_NAME#v}"
@@ -358,7 +544,24 @@ jobs:
             }
           ' "$native_pkg"
 
-          native_bin="node_modules/@jalkarna/archiva-${ARCHIVA_NATIVE_TARGET}/bin/archiva"
+          native_bin="$tmpdir/node_modules/@jalkarna/archiva-${ARCHIVA_NATIVE_TARGET}/bin/archiva"
           test -x "$native_bin"
           actual="$("$native_bin" --version)"
           test "$actual" = "$VERSION"
+
+          project="$(mktemp -d)"
+          cd "$project"
+          "$native_bin" init
+          cat > sample.ts <<'TS'
+          export function smoke(value: number) {
+            if (value > 1 && value < 10) {
+              return value + 1;
+            }
+            return value;
+          }
+          TS
+          "$native_bin" write-decision --json '{"file":"sample.ts","anchor":"fn:smoke","lines":[1,7],"chose":"exercise musl published package behavior","because":"post-publish musl smoke must cover write, read, lint, status, and MCP behavior, not only version output","rejected":[{"approach":"version-only smoke","reason":"that does not prove decision storage or MCP behavior works on musl"}]}'
+          "$native_bin" why sample.ts fn:smoke | grep "exercise musl published package behavior"
+          "$native_bin" status | grep "1 decisions"
+          "$native_bin" lint | grep "No decision issues found"
+          printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | "$native_bin" mcp | grep '"tools"'

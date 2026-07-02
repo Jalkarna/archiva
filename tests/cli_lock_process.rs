@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,8 +12,11 @@ use archiva::core::fs::acquire_file_lock_now;
 use archiva::core::paths::{decision_lock_path, dlog_path, dmap_path, RelativePath};
 use archiva::core::storage::load_dlog;
 
+static PROCESS_LOCK_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
 #[test]
 fn concurrent_cli_write_decisions_serialize_across_processes() {
+    let _serial = serialize_process_lock_test();
     let root = unique_temp_dir("archiva-cli-process-lock");
     let source_path = root.join("src").join("concurrent.ts");
     fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -87,6 +90,7 @@ fn concurrent_cli_write_decisions_serialize_across_processes() {
 
 #[test]
 fn concurrent_cli_write_decisions_recover_one_stale_lock_and_serialize() {
+    let _serial = serialize_process_lock_test();
     let root = unique_temp_dir("archiva-cli-stale-process-lock");
     let source_path = root.join("src").join("stale.ts");
     fs::create_dir_all(source_path.parent().unwrap()).unwrap();
@@ -514,6 +518,10 @@ fn stale_decision_json(index: usize) -> String {
         index * 3 + 1,
         index * 3 + 3
     )
+}
+
+fn serialize_process_lock_test() -> MutexGuard<'static, ()> {
+    PROCESS_LOCK_TEST_MUTEX.lock().unwrap()
 }
 
 fn recovery_lock_path(lock_path: &Path) -> PathBuf {

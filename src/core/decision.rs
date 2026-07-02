@@ -269,6 +269,28 @@ pub fn finish_session_report(output: String) -> String {
     trim_end_newlines(output)
 }
 
+/// Append a "skipped corrupt file" section to a session report so a malformed
+/// `.dlog` is named rather than silently ignored (audit blocker B5). Each entry
+/// is `(file, message)`. No-op when there are no corrupt files.
+pub fn append_session_report_corrupt(output: &mut String, corrupt: &[(RelativePath, String)]) {
+    if corrupt.is_empty() {
+        return;
+    }
+    writeln!(
+        output,
+        "[Archiva] {} decision log{} could not be parsed and {} skipped:",
+        corrupt.len(),
+        if corrupt.len() == 1 { "" } else { "s" },
+        if corrupt.len() == 1 { "was" } else { "were" },
+    )
+    .expect("writing to a String cannot fail");
+    for (file, message) in corrupt {
+        writeln!(output, "  {}: {}", file.as_str(), message)
+            .expect("writing to a String cannot fail");
+    }
+    output.push('\n');
+}
+
 pub fn format_decision(anchor: &str, decision: &DecisionRecord) -> String {
     let status = decision
         .status
@@ -778,6 +800,34 @@ mod tests {
         assert_eq!(record.status, None);
         assert_eq!(record.stale_since, None);
         assert_eq!(record.supersedes, None);
+    }
+
+    #[test]
+    fn build_decision_record_preserves_input_line_range() {
+        let source = "function kept() {\n  return 1;\n}\n";
+        let input = WriteDecisionInput {
+            file: RelativePath::new("src/body.ts").unwrap(),
+            anchor: "fn:kept".to_string(),
+            lines: LineRange { start: 2, end: 2 },
+            chose: "body line".to_string(),
+            because: "caller selected the body".to_string(),
+            rejected: Vec::new(),
+            expires_if: None,
+            supersedes: None,
+            session: None,
+        };
+
+        let record = build_decision_record(
+            &input,
+            "dec_001",
+            source,
+            "2026-06-26T20:31:18.340Z",
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(record.lines_hint, LineRange { start: 2, end: 2 });
+        assert_eq!(record.fingerprint, fingerprint(&get_lines(source, 2, 2)));
     }
 
     #[test]

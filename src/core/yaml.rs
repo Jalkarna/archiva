@@ -3,6 +3,15 @@ use std::fmt;
 
 pub const DEFAULT_MAX_DEPTH: usize = 512;
 
+/// YAML whitespace is exactly space and tab (`s-white`), unlike Rust's
+/// `char::is_whitespace`, which also matches many Unicode separators (NBSP,
+/// em-space, ideographic space, …). Plain-scalar value boundaries must be
+/// trimmed with only these two so a value the renderer emits plain (js-yaml
+/// only escapes/quotes tab and non-space Unicode whitespace via double quotes,
+/// leaving e.g. a trailing em-space in a plain scalar) round-trips intact —
+/// trimming with the full Unicode set silently deleted such characters.
+const YAML_WHITESPACE: [char; 2] = [' ', '\t'];
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum YamlValue {
     Null,
@@ -231,10 +240,20 @@ impl Parser {
         if let Some((key, value_part)) = split_mapping_entry(rest, line_number)? {
             let mut object = YamlObject::new();
             self.check_depth(depth)?;
-            let value = self.parse_mapping_value(value_part, indent, depth + 1)?;
+            // The key sits at column `indent + 2` (past the `- ` marker), so its
+            // value — including any block scalar or nested block — is measured
+            // against `indent + 2`, matching `parse_additional_item_mapping_entries`.
+            let value = self.parse_mapping_value(value_part, indent + 2, depth + 1)?;
             object.insert(key, value);
             self.parse_additional_item_mapping_entries(indent + 2, depth + 1, &mut object)?;
             return Ok(YamlValue::Object(object));
+        }
+
+        // A block scalar as a direct sequence item (`- |`, `- >-`, …): its
+        // content is indented deeper than the dash, so parse it with the
+        // sequence's own indent as the parent.
+        if let Some(header) = parse_block_scalar_header(rest.trim()) {
+            return self.parse_block_scalar(header, indent);
         }
 
         parse_scalar_with_options(rest, self.previous_line_number(), self.options, depth)
@@ -277,28 +296,47 @@ impl Parser {
         indent: usize,
         depth: usize,
     ) -> Result<YamlValue, YamlError> {
-        let trimmed = value_part.trim_start();
+        let trimmed = value_part.trim_start_matches(YAML_WHITESPACE);
         if trimmed.is_empty() {
             let child_indent = self.next_content_indent().unwrap_or(indent + 2);
             return self.parse_block(child_indent, depth);
         }
-        if matches!(trimmed, ">-" | ">" | "|-" | "|") {
-            return self.parse_block_scalar(trimmed, indent);
+        if let Some(header) = parse_block_scalar_header(trimmed) {
+            return self.parse_block_scalar(header, indent);
         }
         parse_scalar_with_options(trimmed, self.previous_line_number(), self.options, depth)
     }
 
     fn parse_block_scalar(
         &mut self,
-        marker: &str,
+        header: BlockScalarHeader,
         parent_indent: usize,
     ) -> Result<YamlValue, YamlError> {
-        let mut collected: Vec<String> = Vec::new();
-        let mut block_indent: Option<usize> = None;
+        // Collect the raw text of every line belonging to the block: a line
+        // belongs while it is blank or indented deeper than the parent key.
+        // `split_lines` appends one empty entry for the document's final
+        // newline; when the block runs to EOF that trailing entry is the line
+        // terminator, not real content, so it is dropped below.
+        let mut raw_lines: Vec<String> = Vec::new();
+        let mut block_indent: Option<usize> = header.explicit_indent.map(|d| parent_indent + d);
         while self.index < self.lines.len() {
             let raw = &self.lines[self.index];
-            if raw.text.trim().is_empty() {
-                collected.push(String::new());
+            let leading_spaces = raw.text.bytes().take_while(|byte| *byte == b' ').count();
+            let is_all_whitespace = raw.text[leading_spaces..].trim().is_empty();
+
+            if is_all_whitespace {
+                // A whitespace-only line is empty unless the block indent is
+                // already known and the line carries spaces *beyond* that indent
+                // — those extra spaces are more-indented content (js-yaml
+                // consumes up to `textIndent` spaces, then treats a non-EOL
+                // remainder as content). Before the indent is detected, or when
+                // the line is not deeper than the indent, it is a blank line.
+                match block_indent {
+                    Some(content_indent) if leading_spaces > content_indent => {
+                        raw_lines.push(raw.text[content_indent..].to_string());
+                    }
+                    _ => raw_lines.push(String::new()),
+                }
                 self.index += 1;
                 continue;
             }
@@ -306,22 +344,21 @@ impl Parser {
             if indent <= parent_indent {
                 break;
             }
+            // Auto-detect the block indent from the first content line when no
+            // explicit indentation indicator was given.
             let content_indent = *block_indent.get_or_insert(indent);
-            let content = if raw.text.len() >= content_indent {
-                raw.text[content_indent..].to_string()
-            } else {
-                String::new()
-            };
-            collected.push(content);
+            let cut = content_indent.min(leading_spaces);
+            raw_lines.push(raw.text[cut..].to_string());
             self.index += 1;
         }
+        let at_eof = self.index >= self.lines.len();
+        if at_eof && raw_lines.last().is_some_and(|line| line.is_empty()) {
+            // Drop the phantom trailing entry produced by the document's final
+            // newline so chomping sees the true blank-line count.
+            raw_lines.pop();
+        }
 
-        let value = if marker.starts_with('>') {
-            fold_block_scalar(&collected, marker.ends_with('-'))
-        } else {
-            literal_block_scalar(&collected, marker.ends_with('-'))
-        };
-        Ok(YamlValue::String(value))
+        Ok(YamlValue::String(assemble_block_scalar(&raw_lines, header)))
     }
 
     fn skip_ignored(&mut self) {
@@ -385,7 +422,7 @@ fn parse_scalar_with_options(
     options: ParseOptions,
     depth: usize,
 ) -> Result<YamlValue, YamlError> {
-    let value = strip_plain_comment(input).trim_end();
+    let value = strip_plain_comment(input).trim_end_matches(YAML_WHITESPACE);
     parse_scalar_value(value, line, options, depth)
 }
 
@@ -694,7 +731,11 @@ impl<'a> FlowParser<'a> {
 }
 
 fn parse_single_quoted(input: &str) -> Option<String> {
-    if !input.starts_with('\'') || !input.ends_with('\'') {
+    // A valid single-quoted scalar needs both a leading and a trailing quote,
+    // which requires at least two bytes. A lone `'` satisfies both
+    // starts_with/ends_with (same byte) but must not be treated as an
+    // (empty) quoted scalar — slicing `input[1..0]` would panic.
+    if input.len() < 2 || !input.starts_with('\'') || !input.ends_with('\'') {
         return None;
     }
     Some(input[1..input.len() - 1].replace("''", "'"))
@@ -910,54 +951,798 @@ fn render_scalar(value: &YamlValue, indent: usize) -> String {
         YamlValue::Null => "null".to_string(),
         YamlValue::Bool(value) => value.to_string(),
         YamlValue::Number(value) => value.to_string(),
-        YamlValue::String(value) if value.contains('\n') => render_literal_block(value, indent),
-        YamlValue::String(value) if value.len() > 100 => render_folded_block(value, indent),
-        YamlValue::String(value) if needs_single_quotes(value) => {
-            format!("'{}'", value.replace('\'', "''"))
-        }
-        YamlValue::String(value) => value.clone(),
+        YamlValue::String(value) => write_string_scalar(value, indent),
         YamlValue::Array(values) if values.is_empty() => "[]".to_string(),
         _ => "null".to_string(),
     }
 }
 
-fn render_literal_block(value: &str, indent: usize) -> String {
-    let mut output = String::from("|-\n");
-    for line in value.split('\n') {
-        write_indent(indent, &mut output);
-        output.push_str(line);
-        output.push('\n');
-    }
-    output.trim_end_matches('\n').to_string()
+/// The block-scalar / quote / plain style chosen for a string, mirroring
+/// js-yaml's `STYLE_*` constants. Byte-for-byte parity with `yaml.dump`
+/// (the behavioral spec) is required: the `.dlog`/`.dmap` differential harness
+/// compares rendered files directly against the TypeScript output.
+#[derive(Clone, Copy, PartialEq)]
+enum ScalarStyle {
+    Plain,
+    Single,
+    Literal,
+    Folded,
+    Double,
 }
 
-fn render_folded_block(value: &str, indent: usize) -> String {
-    let mut output = String::from(">-\n");
-    for line in wrap_words(value, 100 - indent) {
-        write_indent(indent, &mut output);
-        output.push_str(&line);
-        output.push('\n');
+/// Render a string scalar exactly as js-yaml's `writeScalar` does for the
+/// options Archiva uses (`lineWidth: 100`, default indent 2, single quoting).
+///
+/// `indent` is the column the *value* is rendered at, matching js-yaml's
+/// `indent = state.indent * max(1, level)`. The folding width decreases with
+/// indent but is clamped to a floor of 40 — this floor is also what makes the
+/// arithmetic panic-free (the previous `100 - indent` underflowed `usize` and
+/// aborted on deeply nested values, audit-flagged data-corruption bug).
+fn write_string_scalar(value: &str, indent: usize) -> String {
+    if value.is_empty() {
+        return "''".to_string();
     }
-    output.trim_end_matches('\n').to_string()
+    // js-yaml quotes deprecated YAML 1.1 boolean spellings and base-60 numbers
+    // to avoid ambiguity (`noCompatMode` is off by default).
+    if is_deprecated_boolean(value) || is_base60(value) {
+        return format!("'{}'", value.replace('\'', "''"));
+    }
+
+    // Width floor mirrors `max(min(lineWidth, 40), lineWidth - indent)`.
+    let line_width = 100usize.saturating_sub(indent).max(40);
+
+    match choose_scalar_style(value, line_width) {
+        ScalarStyle::Plain => value.to_string(),
+        ScalarStyle::Single => format!("'{}'", value.replace('\'', "''")),
+        ScalarStyle::Literal => {
+            format!(
+                "|{}{}",
+                block_header(value),
+                drop_ending_newline(&indent_string(value, indent))
+            )
+        }
+        ScalarStyle::Folded => {
+            format!(
+                ">{}{}",
+                block_header(value),
+                drop_ending_newline(&indent_string(&fold_string(value, line_width), indent))
+            )
+        }
+        ScalarStyle::Double => format!("\"{}\"", escape_double_quoted(value)),
+    }
 }
 
-fn wrap_words(value: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in value.split_whitespace() {
-        if !current.is_empty() && current.len() + 1 + word.len() > width {
-            lines.push(current);
-            current = String::new();
+/// Port of js-yaml `chooseScalarStyle` for `singleLineOnly = false`,
+/// `quotingType = single`, `forceQuotes = false`.
+fn choose_scalar_style(string: &str, line_width: usize) -> ScalarStyle {
+    let chars: Vec<char> = string.chars().collect();
+    let first = chars[0];
+    let last = chars[chars.len() - 1];
+    let mut plain = is_plain_safe_first(first) && is_plain_safe_last(last);
+
+    let mut has_line_break = false;
+    let mut has_foldable_line = false;
+    let width = line_width as isize;
+    // js-yaml tracks positions in UTF-16 code units (`string.length` / `i`),
+    // advancing the index by 2 for astral chars. Line width and break points
+    // are therefore measured in code units, not scalar values — mirror that
+    // here with `len_utf16` so folding matches `yaml.dump` byte-for-byte on
+    // multibyte (CJK/emoji) text.
+    let mut u16_index: isize = 0;
+    let mut previous_line_break: isize = -1;
+    let mut line_first_is_space = first == ' ';
+    let mut prev_char: Option<char> = None;
+
+    for (char_index, &char) in chars.iter().enumerate() {
+        if char == '\n' {
+            has_line_break = true;
+            // Foldable = the line just closed is longer than the width and is
+            // not more-indented (its first char is not a space).
+            let line_len = u16_index - previous_line_break - 1;
+            has_foldable_line = has_foldable_line || (line_len > width && !line_first_is_space);
+            previous_line_break = u16_index;
+            line_first_is_space = chars.get(char_index + 1) == Some(&' ');
+        } else if !is_printable(char) {
+            return ScalarStyle::Double;
         }
-        if !current.is_empty() {
-            current.push(' ');
+        plain = plain && is_plain_safe(char, prev_char, true);
+        prev_char = Some(char);
+        u16_index += char.len_utf16() as isize;
+    }
+    // Trailing line (no closing `\n`).
+    let line_len = u16_index - previous_line_break - 1;
+    has_foldable_line = has_foldable_line || (line_len > width && !line_first_is_space);
+
+    if !has_line_break && !has_foldable_line {
+        if plain && !is_ambiguous_plain(string) {
+            return ScalarStyle::Plain;
         }
-        current.push_str(word);
+        return ScalarStyle::Single;
     }
-    if !current.is_empty() {
-        lines.push(current);
+    // Block styles are valid. (js-yaml's `indentPerLevel > 9` edge case cannot
+    // occur here: Archiva always dumps with the default indent of 2.)
+    if has_foldable_line {
+        ScalarStyle::Folded
+    } else {
+        ScalarStyle::Literal
     }
-    lines
+}
+
+/// Whether a string would be re-parsed as a non-string scalar under js-yaml's
+/// default schema and therefore cannot be emitted plain (`testImplicitResolving`).
+/// These are faithful ports of the implicit `resolve*` functions js-yaml checks
+/// — null, bool, int, float, timestamp, merge — so the chosen scalar style, and
+/// thus the rendered `.dlog`/`.dmap` bytes, match `yaml.dump` exactly.
+fn is_ambiguous_plain(value: &str) -> bool {
+    resolve_yaml_null(value)
+        || resolve_yaml_bool(value)
+        || resolve_yaml_int(value)
+        || resolve_yaml_float(value)
+        || resolve_yaml_timestamp(value)
+        || value == "<<"
+}
+
+// Port of js-yaml `resolveYamlNull`.
+fn resolve_yaml_null(data: &str) -> bool {
+    data == "~" || data == "null" || data == "Null" || data == "NULL"
+}
+
+// Port of js-yaml `resolveYamlBoolean`.
+fn resolve_yaml_bool(data: &str) -> bool {
+    matches!(data, "true" | "True" | "TRUE" | "false" | "False" | "FALSE")
+}
+
+// Port of js-yaml `resolveYamlInteger`.
+fn resolve_yaml_int(data: &str) -> bool {
+    let bytes = data.as_bytes();
+    let max = bytes.len();
+    if max == 0 {
+        return false;
+    }
+    let mut index = 0;
+    let mut ch = bytes[index];
+    if ch == b'-' || ch == b'+' {
+        index += 1;
+        if index >= max {
+            return false;
+        }
+        ch = bytes[index];
+    }
+
+    if ch == b'0' {
+        if index + 1 == max {
+            return true; // "0"
+        }
+        index += 1;
+        ch = bytes[index];
+        if ch == b'b' {
+            index += 1;
+            let mut has_digits = false;
+            let mut last = ch;
+            while index < max {
+                last = bytes[index];
+                if last == b'_' {
+                    index += 1;
+                    continue;
+                }
+                if last != b'0' && last != b'1' {
+                    return false;
+                }
+                has_digits = true;
+                index += 1;
+            }
+            return has_digits && last != b'_';
+        }
+        if ch == b'x' {
+            index += 1;
+            let mut has_digits = false;
+            let mut last = ch;
+            while index < max {
+                last = bytes[index];
+                if last == b'_' {
+                    index += 1;
+                    continue;
+                }
+                if !last.is_ascii_hexdigit() {
+                    return false;
+                }
+                has_digits = true;
+                index += 1;
+            }
+            return has_digits && last != b'_';
+        }
+        if ch == b'o' {
+            index += 1;
+            let mut has_digits = false;
+            let mut last = ch;
+            while index < max {
+                last = bytes[index];
+                if last == b'_' {
+                    index += 1;
+                    continue;
+                }
+                if !(b'0'..=b'7').contains(&last) {
+                    return false;
+                }
+                has_digits = true;
+                index += 1;
+            }
+            return has_digits && last != b'_';
+        }
+    }
+
+    // base 10 (except leading 0 handled above)
+    if ch == b'_' {
+        return false;
+    }
+    let mut has_digits = false;
+    let mut last = ch;
+    while index < max {
+        last = bytes[index];
+        if last == b'_' {
+            index += 1;
+            continue;
+        }
+        if !last.is_ascii_digit() {
+            return false;
+        }
+        has_digits = true;
+        index += 1;
+    }
+    has_digits && last != b'_'
+}
+
+// Port of js-yaml `resolveYamlFloat` / `YAML_FLOAT_PATTERN`:
+//   ^(?:[-+]?(?:[0-9][0-9_]*)(?:\.[0-9_]*)?(?:[eE][-+]?[0-9]+)?
+//    |\.[0-9_]+(?:[eE][-+]?[0-9]+)?
+//    |[-+]?\.(?:inf|Inf|INF)
+//    |\.(?:nan|NaN|NAN))$
+// plus the "must not end with `_`" guard.
+fn resolve_yaml_float(data: &str) -> bool {
+    if data.is_empty() || data.as_bytes()[data.len() - 1] == b'_' {
+        return false;
+    }
+    float_alt_signed_mantissa(data)
+        || float_alt_dot_leading(data)
+        || float_alt_inf(data)
+        || float_alt_nan(data)
+}
+
+// [-+]? [0-9][0-9_]* (\.[0-9_]*)? ([eE][-+]?[0-9]+)?
+fn float_alt_signed_mantissa(data: &str) -> bool {
+    let b = data.as_bytes();
+    let mut i = 0;
+    if i < b.len() && (b[i] == b'-' || b[i] == b'+') {
+        i += 1;
+    }
+    // [0-9][0-9_]*
+    if i >= b.len() || !b[i].is_ascii_digit() {
+        return false;
+    }
+    i += 1;
+    while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'_') {
+        i += 1;
+    }
+    // (\.[0-9_]*)?
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'_') {
+            i += 1;
+        }
+    }
+    i = match parse_exponent(b, i) {
+        Some(next) => next,
+        None => return false,
+    };
+    i == b.len()
+}
+
+// \.[0-9_]+ ([eE][-+]?[0-9]+)?
+fn float_alt_dot_leading(data: &str) -> bool {
+    let b = data.as_bytes();
+    let mut i = 0;
+    if i >= b.len() || b[i] != b'.' {
+        return false;
+    }
+    i += 1;
+    let digit_start = i;
+    while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'_') {
+        i += 1;
+    }
+    if i == digit_start {
+        return false;
+    }
+    i = match parse_exponent(b, i) {
+        Some(next) => next,
+        None => return false,
+    };
+    i == b.len()
+}
+
+// Optional ([eE][-+]?[0-9]+); returns the index after it, or None if a partial
+// exponent is present but malformed.
+fn parse_exponent(b: &[u8], mut i: usize) -> Option<usize> {
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        if i < b.len() && (b[i] == b'-' || b[i] == b'+') {
+            i += 1;
+        }
+        let digit_start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == digit_start {
+            return None;
+        }
+    }
+    Some(i)
+}
+
+// [-+]?\.(inf|Inf|INF)
+fn float_alt_inf(data: &str) -> bool {
+    let rest = data.strip_prefix(['-', '+']).unwrap_or(data);
+    matches!(rest, ".inf" | ".Inf" | ".INF")
+}
+
+// \.(nan|NaN|NAN)
+fn float_alt_nan(data: &str) -> bool {
+    matches!(data, ".nan" | ".NaN" | ".NAN")
+}
+
+// Port of js-yaml `resolveYamlTimestamp` (YAML_DATE_REGEXP | YAML_TIMESTAMP_REGEXP).
+fn resolve_yaml_timestamp(data: &str) -> bool {
+    matches_yaml_date(data) || matches_yaml_timestamp(data)
+}
+
+// ^\d{4}-\d{2}-\d{2}$
+fn matches_yaml_date(data: &str) -> bool {
+    let b = data.as_bytes();
+    b.len() == 10
+        && b[0..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5].is_ascii_digit()
+        && b[6].is_ascii_digit()
+        && b[7] == b'-'
+        && b[8].is_ascii_digit()
+        && b[9].is_ascii_digit()
+}
+
+// ^\d{4}-\d{1,2}-\d{1,2}([Tt]|[ \t]+)\d{1,2}:\d{2}:\d{2}(\.\d*)?
+//  ([ \t]*(Z|[-+]\d{1,2}(:\d{2})?))?$
+fn matches_yaml_timestamp(data: &str) -> bool {
+    let b = data.as_bytes();
+    let mut i = 0;
+    // year: 4 digits
+    if b.len() < 4 || !b[0..4].iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    i += 4;
+    // -month (1-2 digits)
+    if !consume_byte(b, &mut i, b'-') || !consume_digits(b, &mut i, 1, 2) {
+        return false;
+    }
+    // -day (1-2 digits)
+    if !consume_byte(b, &mut i, b'-') || !consume_digits(b, &mut i, 1, 2) {
+        return false;
+    }
+    // (T | t | [ \t]+)
+    if i < b.len() && (b[i] == b'T' || b[i] == b't') {
+        i += 1;
+    } else {
+        let ws_start = i;
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        if i == ws_start {
+            return false;
+        }
+    }
+    // hour (1-2), :minute (2), :second (2)
+    if !consume_digits(b, &mut i, 1, 2) {
+        return false;
+    }
+    if !consume_byte(b, &mut i, b':') || !consume_digits(b, &mut i, 2, 2) {
+        return false;
+    }
+    if !consume_byte(b, &mut i, b':') || !consume_digits(b, &mut i, 2, 2) {
+        return false;
+    }
+    // (\.\d*)?
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    // ([ \t]*(Z | [-+]\d{1,2}(:\d{2})?))?
+    let mut j = i;
+    while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+        j += 1;
+    }
+    if j < b.len() {
+        if b[j] == b'Z' {
+            j += 1;
+        } else if b[j] == b'-' || b[j] == b'+' {
+            j += 1;
+            if !consume_digits(b, &mut j, 1, 2) {
+                return false;
+            }
+            if j < b.len() && b[j] == b':' {
+                j += 1;
+                if !consume_digits(b, &mut j, 2, 2) {
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        }
+        i = j;
+    }
+    // If there was trailing whitespace but no tz, the regex would not match it,
+    // so require the whole string to be consumed only after the optional tz.
+    i == b.len()
+}
+
+fn consume_byte(b: &[u8], i: &mut usize, expected: u8) -> bool {
+    if *i < b.len() && b[*i] == expected {
+        *i += 1;
+        true
+    } else {
+        false
+    }
+}
+
+fn consume_digits(b: &[u8], i: &mut usize, min: usize, maxd: usize) -> bool {
+    let start = *i;
+    while *i < b.len() && *i - start < maxd && b[*i].is_ascii_digit() {
+        *i += 1;
+    }
+    *i - start >= min
+}
+
+// [33] s-white ::= s-space | s-tab
+fn is_yaml_whitespace(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
+// Printable per YAML 1.2 (js-yaml `isPrintable`): control chars, DEL, the
+// BOM, and the line/paragraph separators are not printable and force escaping.
+fn is_printable(c: char) -> bool {
+    let c = c as u32;
+    (0x00020..=0x00007E).contains(&c)
+        || ((0x000A1..=0x00D7FF).contains(&c) && c != 0x2028 && c != 0x2029)
+        || ((0x0E000..=0x00FFFD).contains(&c) && c != 0xFEFF)
+        || (0x10000..=0x10FFFF).contains(&c)
+}
+
+fn is_ns_char_or_whitespace(c: char) -> bool {
+    is_printable(c) && c != '\u{FEFF}' && c != '\r' && c != '\n'
+}
+
+// Port of js-yaml `isPlainSafe`. `inblock` selects the flow-in relaxation:
+// inside a block scalar the flow indicators `,[]{}` are plain-safe, whereas in
+// flow-out context they are not. Archiva renders all values in block context,
+// so callers pass `inblock = true` (matching `writeNode`'s `inblock = block`).
+fn is_plain_safe(c: char, prev: Option<char>, inblock: bool) -> bool {
+    let c_is_ns_or_ws = is_ns_char_or_whitespace(c);
+    let c_is_ns = c_is_ns_or_ws && !is_yaml_whitespace(c);
+    let prev_is_ns = prev.is_some_and(|p| is_ns_char_or_whitespace(p) && !is_yaml_whitespace(p));
+
+    let base = if inblock {
+        c_is_ns_or_ws
+    } else {
+        c_is_ns_or_ws && c != ',' && c != '[' && c != ']' && c != '{' && c != '}'
+    };
+
+    (base && c != '#' && (prev != Some(':') || c_is_ns))
+        || (prev_is_ns && c == '#')
+        || (prev == Some(':') && c_is_ns)
+}
+
+// Port of js-yaml `isPlainSafeFirst`.
+fn is_plain_safe_first(c: char) -> bool {
+    is_printable(c)
+        && c != '\u{FEFF}'
+        && !is_yaml_whitespace(c)
+        && !matches!(
+            c,
+            '-' | '?'
+                | ':'
+                | ','
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '#'
+                | '&'
+                | '*'
+                | '!'
+                | '|'
+                | '='
+                | '>'
+                | '\''
+                | '"'
+                | '%'
+                | '@'
+                | '`'
+        )
+}
+
+// Port of js-yaml `isPlainSafeLast`.
+fn is_plain_safe_last(c: char) -> bool {
+    !is_yaml_whitespace(c) && c != ':'
+}
+
+// js-yaml `needIndentIndicator`: leading `\n*` then a space.
+fn need_indent_indicator(string: &str) -> bool {
+    let trimmed = string.trim_start_matches('\n');
+    trimmed.starts_with(' ')
+}
+
+// Port of js-yaml `blockHeader`. Archiva's indent is always 2 (single digit),
+// so the indent indicator, when required, is exactly "2".
+fn block_header(string: &str) -> String {
+    let indicator = if need_indent_indicator(string) {
+        "2"
+    } else {
+        ""
+    };
+    let bytes = string.as_bytes();
+    let clip = bytes.last() == Some(&b'\n');
+    let keep = clip && (bytes.len() >= 2 && bytes[bytes.len() - 2] == b'\n' || string == "\n");
+    let chomp = if keep {
+        "+"
+    } else if clip {
+        ""
+    } else {
+        "-"
+    };
+    format!("{indicator}{chomp}\n")
+}
+
+// Port of js-yaml `dropEndingNewline`.
+fn drop_ending_newline(string: &str) -> String {
+    string.strip_suffix('\n').unwrap_or(string).to_string()
+}
+
+// Port of js-yaml `indentString`: indent every non-empty line by `spaces`.
+fn indent_string(string: &str, spaces: usize) -> String {
+    let ind: String = " ".repeat(spaces);
+    let mut result = String::new();
+    let mut position = 0;
+    let bytes = string.as_bytes();
+    while position < bytes.len() {
+        let line = match string[position..].find('\n') {
+            Some(rel) => {
+                let next = position + rel;
+                let line = &string[position..=next];
+                position = next + 1;
+                line
+            }
+            None => {
+                let line = &string[position..];
+                position = bytes.len();
+                line
+            }
+        };
+        if !line.is_empty() && line != "\n" {
+            result.push_str(&ind);
+        }
+        result.push_str(line);
+    }
+    result
+}
+
+// Port of js-yaml `foldString`. Consecutive newlines and more-indented lines
+// (those starting with a space) are preserved rather than folded, so internal
+// whitespace runs survive a round-trip — unlike the previous word-splitting
+// wrapper, which collapsed them (audit-flagged data-corruption bug).
+fn fold_string(string: &str, width: usize) -> String {
+    let first_lf = string.find('\n').unwrap_or(string.len());
+    let mut result = fold_line(&string[..first_lf], width);
+
+    let mut prev_more_indented = string.starts_with('\n') || string.starts_with(' ');
+
+    // Iterate `(\n+)([^\n]*)` chunks over the remainder.
+    let rest = &string[first_lf..];
+    let rest_chars: Vec<char> = rest.chars().collect();
+    let mut i = 0;
+    while i < rest_chars.len() {
+        if rest_chars[i] != '\n' {
+            // Should not happen: `first_lf` lands on a newline or end.
+            break;
+        }
+        let mut prefix = String::new();
+        while i < rest_chars.len() && rest_chars[i] == '\n' {
+            prefix.push('\n');
+            i += 1;
+        }
+        let mut line = String::new();
+        while i < rest_chars.len() && rest_chars[i] != '\n' {
+            line.push(rest_chars[i]);
+            i += 1;
+        }
+        let more_indented = line.starts_with(' ');
+        result.push_str(&prefix);
+        if !prev_more_indented && !more_indented && !line.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&fold_line(&line, width));
+        prev_more_indented = more_indented;
+    }
+    result
+}
+
+// Port of js-yaml `foldLine`: greedy line breaking at ` [^ ]` boundaries.
+// js-yaml indexes and slices the line by UTF-16 code units, so operate on the
+// UTF-16 encoding here. Break points always fall on ASCII spaces (single code
+// units) and the slice bounds land right after them, so no surrogate pair is
+// ever split.
+fn fold_line(line: &str, width: usize) -> String {
+    if line.is_empty() || line.starts_with(' ') {
+        return line.to_string();
+    }
+    let units: Vec<u16> = line.encode_utf16().collect();
+    let width = width as isize;
+    let mut start: isize = 0;
+    let mut curr: isize = 0;
+    let mut result = String::new();
+
+    // Emulate `/ [^ ]/g`: a space (0x20) followed by a non-space; the match
+    // index is the space position.
+    let mut positions = Vec::new();
+    let mut idx = 0;
+    while idx + 1 < units.len() {
+        if units[idx] == 0x20 && units[idx + 1] != 0x20 {
+            positions.push(idx as isize);
+        }
+        idx += 1;
+    }
+
+    for &next in &positions {
+        if next - start > width {
+            let end = if curr > start { curr } else { next };
+            result.push('\n');
+            push_u16_slice(&mut result, &units, start, end);
+            start = end + 1;
+        }
+        curr = next;
+    }
+
+    result.push('\n');
+    if units.len() as isize - start > width && curr > start {
+        push_u16_slice(&mut result, &units, start, curr);
+        result.push('\n');
+        push_u16_slice(&mut result, &units, curr + 1, units.len() as isize);
+    } else {
+        push_u16_slice(&mut result, &units, start, units.len() as isize);
+    }
+
+    // Drop the leading `\n` joiner (js-yaml `result.slice(1)`).
+    result[1..].to_string()
+}
+
+fn push_u16_slice(out: &mut String, units: &[u16], start: isize, end: isize) {
+    let start = start.max(0) as usize;
+    let end = (end.max(0) as usize).min(units.len());
+    if start >= end {
+        return;
+    }
+    // Slice bounds fall after ASCII spaces, so the range is always a valid
+    // UTF-16 subsequence; `from_utf16_lossy` is a defensive no-op here.
+    out.push_str(&String::from_utf16_lossy(&units[start..end]));
+}
+
+// Port of js-yaml `escapeString` (double-quoted body).
+fn escape_double_quoted(string: &str) -> String {
+    let mut result = String::new();
+    for c in string.chars() {
+        if let Some(seq) = escape_sequence(c) {
+            result.push_str(seq);
+        } else if is_printable(c) {
+            result.push(c);
+        } else {
+            result.push_str(&encode_hex(c));
+        }
+    }
+    result
+}
+
+fn escape_sequence(c: char) -> Option<&'static str> {
+    match c as u32 {
+        0x00 => Some("\\0"),
+        0x07 => Some("\\a"),
+        0x08 => Some("\\b"),
+        0x09 => Some("\\t"),
+        0x0A => Some("\\n"),
+        0x0B => Some("\\v"),
+        0x0C => Some("\\f"),
+        0x0D => Some("\\r"),
+        0x1B => Some("\\e"),
+        0x22 => Some("\\\""),
+        0x5C => Some("\\\\"),
+        0x85 => Some("\\N"),
+        0xA0 => Some("\\_"),
+        0x2028 => Some("\\L"),
+        0x2029 => Some("\\P"),
+        _ => None,
+    }
+}
+
+// Port of js-yaml `encodeHex`.
+fn encode_hex(c: char) -> String {
+    let code = c as u32;
+    let hex = format!("{code:X}");
+    let (handle, width) = if code <= 0xFF {
+        ('x', 2)
+    } else if code <= 0xFFFF {
+        ('u', 4)
+    } else {
+        ('U', 8)
+    };
+    format!("\\{handle}{:0>width$}", hex, width = width)
+}
+
+fn is_deprecated_boolean(value: &str) -> bool {
+    matches!(
+        value,
+        "y" | "Y"
+            | "yes"
+            | "Yes"
+            | "YES"
+            | "on"
+            | "On"
+            | "ON"
+            | "n"
+            | "N"
+            | "no"
+            | "No"
+            | "NO"
+            | "off"
+            | "Off"
+            | "OFF"
+    )
+}
+
+// js-yaml `DEPRECATED_BASE60_SYNTAX`: /^[-+]?[0-9_]+(?::[0-9_]+)+(?:\.[0-9_]*)?$/
+fn is_base60(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    if matches!(bytes.first(), Some(b'-') | Some(b'+')) {
+        i += 1;
+    }
+    // First [0-9_]+ group.
+    let group_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if i == group_start {
+        return false;
+    }
+    // One or more (:[0-9_]+) groups.
+    let mut colon_groups = 0;
+    while i < bytes.len() && bytes[i] == b':' {
+        i += 1;
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+        colon_groups += 1;
+    }
+    if colon_groups == 0 {
+        return false;
+    }
+    // Optional (\.[0-9_]*).
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+            i += 1;
+        }
+    }
+    i == bytes.len()
 }
 
 fn needs_single_quotes(value: &str) -> bool {
@@ -1043,37 +1828,127 @@ fn looks_like_timestamp(value: &str) -> bool {
         && matches!(bytes.get(16), Some(b':'))
 }
 
-fn fold_block_scalar(lines: &[String], strip_final_newline: bool) -> String {
-    let mut output = String::new();
-    let mut previous_blank = false;
-    for line in lines {
-        if line.is_empty() {
-            if !output.ends_with('\n') && !output.is_empty() {
-                output.push('\n');
-            }
-            previous_blank = true;
-            continue;
-        }
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push(' ');
-        } else if previous_blank && !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str(line.trim_end());
-        previous_blank = false;
-    }
-    if !strip_final_newline {
-        output.push('\n');
-    }
-    output
+/// Parsed leading indicators of a block scalar (`|`/`>` plus optional chomping
+/// and explicit indentation width), mirroring js-yaml's `readBlockScalar`.
+#[derive(Clone, Copy)]
+struct BlockScalarHeader {
+    folding: bool,
+    chomping: Chomping,
+    explicit_indent: Option<usize>,
 }
 
-fn literal_block_scalar(lines: &[String], strip_final_newline: bool) -> String {
-    let mut output = lines.join("\n");
-    if !strip_final_newline {
-        output.push('\n');
+#[derive(Clone, Copy, PartialEq)]
+enum Chomping {
+    Clip,
+    Strip,
+    Keep,
+}
+
+/// Parse a block-scalar header token such as `|`, `>-`, `|+`, `>2`, `|2-`.
+/// Returns `None` if the token is not a block-scalar indicator.
+fn parse_block_scalar_header(token: &str) -> Option<BlockScalarHeader> {
+    let bytes = token.as_bytes();
+    let folding = match bytes.first()? {
+        b'|' => false,
+        b'>' => true,
+        _ => return None,
+    };
+    let mut chomping = Chomping::Clip;
+    let mut explicit_indent: Option<usize> = None;
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' | b'-' => {
+                // A repeated chomping indicator is malformed; reject so the
+                // token falls through to plain-scalar handling.
+                if chomping != Chomping::Clip {
+                    return None;
+                }
+                chomping = if bytes[i] == b'+' {
+                    Chomping::Keep
+                } else {
+                    Chomping::Strip
+                };
+            }
+            d @ b'1'..=b'9' => {
+                if explicit_indent.is_some() {
+                    return None;
+                }
+                explicit_indent = Some((d - b'0') as usize);
+            }
+            _ => return None,
+        }
+        i += 1;
     }
-    output
+    Some(BlockScalarHeader {
+        folding,
+        chomping,
+        explicit_indent,
+    })
+}
+
+/// Assemble a block scalar from its indent-stripped content lines, applying
+/// js-yaml's folding and chomping rules (`readBlockScalar`). Blank lines are
+/// empty strings; more-indented lines retain their extra leading spaces.
+fn assemble_block_scalar(lines: &[String], header: BlockScalarHeader) -> String {
+    let mut result = String::new();
+    let mut did_read_content = false;
+    let mut at_more_indented = false;
+    let mut empty_lines = 0usize;
+
+    for line in lines {
+        if line.is_empty() {
+            empty_lines += 1;
+            continue;
+        }
+        let more_indented = line.starts_with(' ');
+        if header.folding {
+            if more_indented {
+                at_more_indented = true;
+                result.push_str(&"\n".repeat(if did_read_content {
+                    1 + empty_lines
+                } else {
+                    empty_lines
+                }));
+            } else if at_more_indented {
+                at_more_indented = false;
+                result.push_str(&"\n".repeat(empty_lines + 1));
+            } else if empty_lines == 0 {
+                if did_read_content {
+                    result.push(' ');
+                }
+            } else {
+                result.push_str(&"\n".repeat(empty_lines));
+            }
+        } else {
+            result.push_str(&"\n".repeat(if did_read_content {
+                1 + empty_lines
+            } else {
+                empty_lines
+            }));
+        }
+        did_read_content = true;
+        empty_lines = 0;
+        result.push_str(line);
+    }
+
+    // End-of-scalar chomping.
+    match header.chomping {
+        Chomping::Keep => {
+            result.push_str(&"\n".repeat(if did_read_content {
+                1 + empty_lines
+            } else {
+                empty_lines
+            }));
+        }
+        Chomping::Clip => {
+            if did_read_content {
+                result.push('\n');
+            }
+        }
+        Chomping::Strip => {}
+    }
+    result
 }
 
 fn split_mapping_entry(content: &str, line: usize) -> Result<Option<(String, &str)>, YamlError> {
@@ -1110,7 +1985,7 @@ fn split_mapping_entry(content: &str, line: usize) -> Result<Option<(String, &st
             let raw_key = content[..index].trim_end();
             return Ok(Some((
                 parse_mapping_key(raw_key, line)?,
-                content[index + 1..].trim_start(),
+                content[index + 1..].trim_start_matches(YAML_WHITESPACE),
             )));
         }
         index += 1;
@@ -1461,5 +2336,71 @@ mod tests {
             YamlValue::Array(values) => values,
             _ => panic!("expected array, got {value:?}"),
         }
+    }
+
+    fn roundtrip_string(value: &str) -> String {
+        let mut object = YamlObject::new();
+        object.insert("k".to_string(), YamlValue::String(value.to_string()));
+        let document = YamlValue::Object(object);
+        let rendered = render_yaml(&document);
+        let parsed = parse_yaml(&rendered)
+            .unwrap_or_else(|error| panic!("parse failed for {value:?}: {error:?}\n{rendered}"));
+        match as_object(&parsed).get("k") {
+            Some(YamlValue::String(round)) => round.clone(),
+            other => panic!("expected string, got {other:?} for {value:?}\n{rendered}"),
+        }
+    }
+
+    #[test]
+    fn string_scalars_round_trip_without_corruption() {
+        // Regression coverage for the block-scalar / folding / quoting rewrite:
+        // every category below previously either corrupted the value on
+        // round-trip or panicked in the renderer.
+        let cases = [
+            // Whitespace runs must survive folding (were collapsed by the old
+            // word-splitting wrapper).
+            "We picked the queue-based design.  It decouples producers from consumers and survives restarts.",
+            "alpha    beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma",
+            // CR / tab force double-quoting (were mangled into block scalars).
+            "carriage\rreturn value that also runs well beyond one hundred characters to force a long scalar",
+            "tab\tseparated value that likewise runs beyond one hundred characters to force a long scalar body",
+            &("crlf\r\nspanning".to_string() + &"z".repeat(120)),
+            // Trailing / leading whitespace on a long value.
+            &("trailing spaces  ".to_string() + &"z".repeat(110)),
+            &("   leading spaces ".to_string() + &"z".repeat(110)),
+            // Multiline literal blocks (chomping must not add a trailing newline).
+            "line one\nline two",
+            "line one\nline two\n",
+            "line one\nline two\n\n",
+            "\n",
+            // Plain multi-word text under the wrap width.
+            "short plain value",
+            // Unicode whitespace at the value boundary must survive: the
+            // renderer emits it plain (only tab / space govern YAML trimming),
+            // so a full-Unicode trim on parse would silently delete it.
+            "value\u{2003}",
+            "\u{2003}value",
+            "value\u{3000}",
+            "\u{1680}value\u{205F}",
+            "\u{2003}",
+        ];
+        for case in cases {
+            assert_eq!(roundtrip_string(case), *case, "round-trip mismatch");
+        }
+    }
+
+    #[test]
+    fn deeply_nested_long_string_renders_without_panicking() {
+        // The old renderer computed `100 - indent` for the fold width, which
+        // underflowed `usize` and aborted once the value sat past column 100.
+        let mut value =
+            YamlValue::String("a long value that exceeds one hundred characters ".repeat(3));
+        for index in 0..80 {
+            let mut object = YamlObject::new();
+            object.insert(format!("k{index}"), value);
+            value = YamlValue::Object(object);
+        }
+        let rendered = render_yaml(&value);
+        assert_eq!(parse_yaml(&rendered).unwrap(), value);
     }
 }
