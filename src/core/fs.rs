@@ -10,7 +10,7 @@ use crate::core::error::{ArchivaError, Result};
 use crate::core::time::{now_utc_millis, parse_utc_millis};
 
 const STALE_LOCK_AGE_MILLIS: i128 = 2 * 60 * 1000;
-const LOCK_RETRY_TIMEOUT_MILLIS: u64 = 1_000;
+const LOCK_RETRY_TIMEOUT_MILLIS: u64 = if cfg!(windows) { 5_000 } else { 1_000 };
 const LOCK_RETRY_SLEEP_MILLIS: u64 = 20;
 const LOCK_METADATA_MAX_BYTES: usize = 64 * 1024;
 pub const TEXT_FILE_MAX_BYTES: usize = 10 * 1024 * 1024;
