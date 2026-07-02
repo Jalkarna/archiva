@@ -69,7 +69,7 @@ jobs:
           rustup default 1.96.0
 
       - name: Install
-        run: npm ci
+        run: npm ci --omit=optional
 
       - name: Check
         run: npm run check
@@ -293,7 +293,7 @@ jobs:
           rustup default 1.96.0
 
       - name: Install
-        run: npm ci
+        run: npm ci --omit=optional
 
       - name: Build package artifacts
         run: npm run build

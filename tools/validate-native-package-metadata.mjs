@@ -673,6 +673,17 @@ function validateCiTestWorkflowBehavior(file, text) {
   }
 }
 
+function validateSourceInstallOmitsOptional(file, text, jobNames) {
+  for (const jobName of jobNames) {
+    const block = workflowJobBlock(file, text, jobName);
+    const body = block.map((item) => item.line).join("\n");
+    assert(
+      body.includes("run: npm ci --omit=optional"),
+      `${file} job ${jobName} source install must omit registry optional native packages.`
+    );
+  }
+}
+
 function validatePublishNativeWorkflowBehavior(file, text) {
   const block = workflowJobBlock(file, text, "publish-native");
   const body = block.map((item) => item.line).join("\n");
@@ -829,6 +840,9 @@ async function validateWorkflowMatrices() {
   validateWorkflowActionPins(ciFile, ci);
   validateWorkflowActionPins(publishFile, publish);
   validateWorkflowActionPins(validationFile, validation);
+  validateSourceInstallOmitsOptional(ciFile, ci, ["native-package", "test"]);
+  validateSourceInstallOmitsOptional(publishFile, publish, ["heavy-validation", "long-horizon-corpus", "publish-native", "publish-meta"]);
+  validateSourceInstallOmitsOptional(validationFile, validation, ["heavy-validation", "long-horizon-corpus"]);
   validateNativeBuildWorkflowMatrix(ciFile, ci, "native-package");
   validateNativeBuildWorkflowMatrix(publishFile, publish, "publish-native");
   validateNativePackageSmokeWorkflowBehavior(ciFile, ci, "native-package");

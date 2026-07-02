@@ -43,7 +43,7 @@ jobs:
           rustup default 1.96.0
 
       - name: Install
-        run: npm ci
+        run: npm ci --omit=optional
 
       - name: Verify release version
         run: |
@@ -293,7 +293,7 @@ jobs:
           rustup default 1.96.0
 
       - name: Install
-        run: npm ci
+        run: npm ci --omit=optional
 
       - name: Build package artifacts
         run: npm run build
@@ -380,7 +380,7 @@ jobs:
           rustup target add ${{ matrix.rust_target }}
 
       - name: Install
-        run: npm ci
+        run: npm ci --omit=optional
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.rust_target }}
@@ -416,7 +416,7 @@ jobs:
           cache: npm
 
       - name: Install
-        run: npm ci
+        run: npm ci --omit=optional
 
       - name: Verify native packages are published
         run: node tools/npm-publish-idempotent.mjs --verify-native-targets
