@@ -24,7 +24,10 @@ The Rust implementation is present and is the package entrypoint. Current eviden
 - `npm run scale:corpus:rust` against `src/`: passed with 31 selected Rust files, 24 decision writes, and mixed Rust anchor-kind coverage.
 - `npm run benchmark:compare`: passed within configured runtime and RSS thresholds; heavy-validation measured Rust peak RSS under 3 MiB and all benchmark ratios were within gate.
 - `cargo run --quiet -- lint`: passed.
-- `cargo run --quiet -- status`: 594 decisions, 0 stale, 0 orphan, 0 issues.
+- `cargo run --quiet -- status`: 595 decisions, 0 stale, 0 orphan, 0 issues.
+- GitHub CI run `28557738719`: passed on release commit `1409d7d0e4ad99818c59e7fa6c7d5374950a836c`, including Linux, macOS, and Windows Rust jobs; robustness gates; all seven native package build/smoke jobs; and the main test job.
+- Publish workflow run `28557741247`: passed on release commit `1409d7d0e4ad99818c59e7fa6c7d5374950a836c`, including heavy validation, all ten long-horizon corpus jobs, all seven native package publishes, root package publish, GNU/glibc post-publish smoke, and Alpine musl post-publish smoke.
+- npm registry verification: `@jalkarna/archiva@0.2.1` and all seven `@jalkarna/archiva-<target>@0.2.1` native packages are published.
 
 ## Independent Review Findings Addressed
 
@@ -57,9 +60,10 @@ The previously missing external validation evidence is now archived for this com
 - Linux arm64 and musl native package build/smoke results: proven by CI run `28549540760`.
 - full heavy-validation workflow artifacts: proven by Heavy validation run `28549550140`.
 - scheduled or manually triggered long-horizon corpus artifacts: proven by long-horizon jobs in run `28551553784`.
+- npm publish and post-publish install smoke artifacts: proven by Publish workflow run `28557741247`.
 
 ## Remaining Release Evidence
 
-- npm publish and post-publish install smoke artifacts still require a real release/tagged publish workflow run.
+No release evidence remains outstanding.
 
-Until publish and post-publish artifacts exist and pass, the release v2 objective remains active rather than complete.
+The release v2 objective is complete.

@@ -77,24 +77,26 @@ describe("v2 completion audit", () => {
     );
   });
 
-  it("fails strict completion until external evidence is supplied and accepted", () => {
+  it("passes strict completion after release evidence is archived", () => {
     const result = runAudit(["--json", "--strict-complete"]);
 
-    expect(result.status).toBe(1);
+    expect(result.status).toBe(0);
     const output = parseAuditOutput(result.stdout);
-    expect(output.status).toBe("failed");
-    expect(output.externalEvidenceStillRequired).toContain("npm publish and post-publish install smoke artifacts");
+    expect(output.status).toBe("passed");
+    expect(output.externalEvidenceArchived).toContain("npm publish and post-publish install smoke artifacts");
+    expect(output.externalEvidenceStillRequired).toEqual([]);
   });
 
-  it("fails strict completion even with a passing evidence bundle", async () => {
+  it("passes strict completion with a passing evidence bundle", async () => {
     const evidenceDir = await evidenceBundle();
     const result = runAudit(["--json", "--strict-complete", "--evidence-dir", evidenceDir]);
 
-    expect(result.status).toBe(1);
+    expect(result.status).toBe(0);
     const output = parseAuditOutput(result.stdout);
-    expect(output.status).toBe("failed");
+    expect(output.status).toBe("passed");
     expect(output.externalEvidenceArchived).toContain("scheduled or manually triggered long-horizon corpus artifacts");
-    expect(output.externalEvidenceStillRequired).toEqual(["npm publish and post-publish install smoke artifacts"]);
+    expect(output.externalEvidenceArchived).toContain("npm publish and post-publish install smoke artifacts");
+    expect(output.externalEvidenceStillRequired).toEqual([]);
   });
 
   it("fails when a release soak script is weakened", async () => {

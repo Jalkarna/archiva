@@ -97,12 +97,11 @@ const archivedEvidenceNeedles = [
   "macOS and Windows Rust build/test results",
   "Linux arm64 and musl native package build/smoke results",
   "full heavy-validation workflow artifacts",
-  "scheduled or manually triggered long-horizon corpus artifacts"
-];
-
-const remainingReleaseEvidenceNeedles = [
+  "scheduled or manually triggered long-horizon corpus artifacts",
   "npm publish and post-publish install smoke artifacts"
 ];
+
+const remainingReleaseEvidenceNeedles = [];
 
 const hasJson = process.argv.includes("--json");
 const hasStrictComplete = process.argv.includes("--strict-complete");
@@ -264,9 +263,9 @@ async function auditDocumentationHonesty() {
   const readme = await readText("README.md");
 
   assertCheck("architecture document exists and covers future extension points", "docs/archiva-v2-architecture.md", architecture.includes("## Future Extension Points"));
-  assertCheck("review status keeps release goal active until publish artifacts pass", "docs/archiva-v2-review-status.md", review.includes("release v2 objective remains active rather than complete"));
+  assertCheck("review status marks release complete after publish artifacts passed", "docs/archiva-v2-review-status.md", review.includes("release v2 objective is complete"));
   assertCheck("review status lists archived external validation evidence", "docs/archiva-v2-review-status.md", includesAll(review, archivedEvidenceNeedles));
-  assertCheck("review status lists remaining release evidence", "docs/archiva-v2-review-status.md", includesAll(review, remainingReleaseEvidenceNeedles));
+  assertCheck("review status says no release evidence remains", "docs/archiva-v2-review-status.md", review.includes("No release evidence remains outstanding."));
   assertCheck("README links v2 architecture and review status", "README.md", includesAll(readme, ["docs/archiva-v2-architecture.md", "docs/archiva-v2-review-status.md"]));
   assertCheck("README heavy-validation commands include release stress soak", "README.md", readme.includes("npm run stress:soak"));
 }
@@ -331,11 +330,7 @@ function printHuman() {
     process.exitCode = 1;
     return;
   }
-  console.log(`Archiva v2 completion audit OK (${checks.length} local evidence checks). Release publish and post-publish evidence is still required before marking the published release complete.`);
-  if (hasStrictComplete) {
-    console.error("Strict completion mode failed: publish and post-publish evidence is intentionally still required.");
-    process.exitCode = 1;
-  }
+  console.log(`Archiva v2 completion audit OK (${checks.length} local evidence checks). Published release evidence is archived; strict completion is allowed.`);
 }
 
 async function main() {
@@ -350,10 +345,11 @@ async function main() {
 
   if (hasJson) {
     const failed = checks.filter((check) => !check.passed);
+    const strictFailure = hasStrictComplete && remainingReleaseEvidenceNeedles.length > 0;
     console.log(
       JSON.stringify(
         {
-          status: failed.length === 0 && !hasStrictComplete ? "passed" : "failed",
+          status: failed.length === 0 && !strictFailure ? "passed" : "failed",
           localChecks: checks,
           evidenceDir: evidenceDir ?? null,
           externalEvidenceArchived: archivedEvidenceNeedles,
@@ -363,7 +359,7 @@ async function main() {
         2
       )
     );
-    process.exitCode = failed.length === 0 && !hasStrictComplete ? 0 : 1;
+    process.exitCode = failed.length === 0 && !strictFailure ? 0 : 1;
     return;
   }
   printHuman();
