@@ -115,7 +115,7 @@ jobs:
           rustup target add ${{ matrix.rust_target }}
 
       - name: Install
-        run: npm ci --omit=optional
+        run: npm ci
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.rust_target }}
@@ -154,7 +154,7 @@ jobs:
           rustup default 1.96.0
 
       - name: Install
-        run: npm ci --omit=optional
+        run: npm ci
 
       - name: Typecheck
         run: npm run check

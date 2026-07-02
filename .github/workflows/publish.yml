@@ -42,8 +42,11 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.96.0
 
+      - name: Refresh lockfile registry metadata
+        run: npm install --package-lock-only --ignore-scripts
+
       - name: Install
-        run: npm ci --omit=optional
+        run: npm ci
 
       - name: Verify release version
         run: |
@@ -292,8 +295,11 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
           rustup default 1.96.0
 
+      - name: Refresh lockfile registry metadata
+        run: npm install --package-lock-only --ignore-scripts
+
       - name: Install
-        run: npm ci --omit=optional
+        run: npm ci
 
       - name: Build package artifacts
         run: npm run build
@@ -379,8 +385,11 @@ jobs:
           rustup default 1.96.0
           rustup target add ${{ matrix.rust_target }}
 
+      - name: Refresh lockfile registry metadata
+        run: npm install --package-lock-only --ignore-scripts
+
       - name: Install
-        run: npm ci --omit=optional
+        run: npm ci
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.rust_target }}
@@ -415,8 +424,11 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           cache: npm
 
+      - name: Refresh lockfile registry metadata
+        run: npm install --package-lock-only --ignore-scripts
+
       - name: Install
-        run: npm ci --omit=optional
+        run: npm ci
 
       - name: Verify native packages are published
         run: node tools/npm-publish-idempotent.mjs --verify-native-targets

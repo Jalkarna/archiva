@@ -673,13 +673,13 @@ function validateCiTestWorkflowBehavior(file, text) {
   }
 }
 
-function validateSourceInstallOmitsOptional(file, text, jobNames) {
-  for (const jobName of jobNames) {
+function validatePublishWorkflowLockfileRefresh(file, text) {
+  for (const jobName of ["heavy-validation", "long-horizon-corpus", "publish-native", "publish-meta"]) {
     const block = workflowJobBlock(file, text, jobName);
     const body = block.map((item) => item.line).join("\n");
     assert(
-      body.includes("run: npm ci --omit=optional"),
-      `${file} job ${jobName} source install must omit registry optional native packages.`
+      body.includes("npm install --package-lock-only --ignore-scripts"),
+      `${file} job ${jobName} must refresh lockfile registry metadata before npm ci.`
     );
   }
 }
@@ -840,9 +840,7 @@ async function validateWorkflowMatrices() {
   validateWorkflowActionPins(ciFile, ci);
   validateWorkflowActionPins(publishFile, publish);
   validateWorkflowActionPins(validationFile, validation);
-  validateSourceInstallOmitsOptional(ciFile, ci, ["native-package", "test"]);
-  validateSourceInstallOmitsOptional(publishFile, publish, ["heavy-validation", "long-horizon-corpus", "publish-native", "publish-meta"]);
-  validateSourceInstallOmitsOptional(validationFile, validation, ["heavy-validation", "long-horizon-corpus"]);
+  validatePublishWorkflowLockfileRefresh(publishFile, publish);
   validateNativeBuildWorkflowMatrix(ciFile, ci, "native-package");
   validateNativeBuildWorkflowMatrix(publishFile, publish, "publish-native");
   validateNativePackageSmokeWorkflowBehavior(ciFile, ci, "native-package");
