@@ -48,6 +48,9 @@ jobs:
       - name: Install
         run: npm ci
 
+      - name: Restore committed lockfile
+        run: git checkout -- package-lock.json
+
       - name: Verify release version
         run: |
           node --input-type=module <<'NODE'
@@ -301,6 +304,9 @@ jobs:
       - name: Install
         run: npm ci
 
+      - name: Restore committed lockfile
+        run: git checkout -- package-lock.json
+
       - name: Build package artifacts
         run: npm run build
 
@@ -391,6 +397,9 @@ jobs:
       - name: Install
         run: npm ci
 
+      - name: Restore committed lockfile
+        run: git checkout -- package-lock.json
+
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.rust_target }}
 
@@ -429,6 +438,9 @@ jobs:
 
       - name: Install
         run: npm ci
+
+      - name: Restore committed lockfile
+        run: git checkout -- package-lock.json
 
       - name: Verify native packages are published
         run: node tools/npm-publish-idempotent.mjs --verify-native-targets

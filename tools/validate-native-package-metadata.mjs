@@ -681,6 +681,10 @@ function validatePublishWorkflowLockfileRefresh(file, text) {
       body.includes("npm install --package-lock-only --ignore-scripts"),
       `${file} job ${jobName} must refresh lockfile registry metadata before npm ci.`
     );
+    assert(
+      body.includes("git checkout -- package-lock.json"),
+      `${file} job ${jobName} must restore the committed lockfile after npm ci.`
+    );
   }
 }
 
